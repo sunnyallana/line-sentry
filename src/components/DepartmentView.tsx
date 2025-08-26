@@ -46,6 +46,7 @@ const DepartmentView: React.FC = () => {
   const [machineStatuses, setMachineStatuses] = useState<{[key: string]: string}>({});
   const layoutContainerRef = useRef<HTMLDivElement>(null);
   const [machineStats, setMachineStats] = useState<{[machineId: string]: MachineStats}>({});
+  const [bgImageExists, setBgImageExists] = useState(false);
   const dragOffset = useRef({ x: 0, y: 0 });
   const resizeInitial = useRef({ width: 0, height: 0, x: 0, y: 0 });
   const machinesRef = useRef<Machine[]>([]);
@@ -103,6 +104,21 @@ const DepartmentView: React.FC = () => {
       stoppedMachines
     };
   }, [machines, machineStats]);
+
+  const toSnakeCase = (str: string) => {
+    return str.toLowerCase().replace(/\s+/g, '_');
+  };
+
+  useEffect(() => {
+    if (department) {
+      const img = new Image();
+      const imageName = toSnakeCase(department.name);
+      img.src = `/${imageName}.png`;
+      img.onload = () => setBgImageExists(true);
+      img.onerror = () => setBgImageExists(false);
+    }
+  }, [department]);
+
 
   useEffect(() => {
     if (id) {
@@ -620,9 +636,19 @@ const DepartmentView: React.FC = () => {
           {machines.length > 0 ? (
             <div 
               ref={layoutContainerRef}
-              className={`relative w-full min-h-[700px] ${
+              className={`relative w-full min-h-[700px] rounded-lg border border-dashed ${cardBorderClass} ${
                 isDarkMode ? 'bg-gray-900/50' : 'bg-gray-100'
-              } rounded-lg border border-dashed ${cardBorderClass}`}
+              }`}
+              style={
+                bgImageExists && department
+                  ? {
+                      backgroundImage: `url(/${toSnakeCase(department.name)}.png)`,
+                      backgroundSize: 'contain',
+                      backgroundPosition: 'center',
+                      backgroundRepeat: 'no-repeat'
+                    }
+                  : {}
+              }
               onMouseMove={handleMouseMove}
               onMouseUp={handleMouseUp}
               onMouseLeave={handleMouseUp}
