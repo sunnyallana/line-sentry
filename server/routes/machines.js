@@ -22,7 +22,7 @@ router.get('/department/:departmentId', auth, async (req, res) => {
     
     res.json(machines);
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
@@ -41,7 +41,7 @@ router.get('/:id', auth, async (req, res) => {
 
     res.json(machine);
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
@@ -51,7 +51,7 @@ router.get('/', auth, adminAuth, async (req, res) => {
     const machines = await Machine.find({ isActive: true }).populate('departmentId').lean();
     res.json(machines);
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
@@ -66,7 +66,7 @@ router.post('/', auth, adminAuth, async (req, res) => {
     await machine.save();
     res.status(201).json(machine);
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
@@ -83,7 +83,7 @@ router.put('/:id', auth, adminAuth, async (req, res) => {
     }
     res.json(machine);
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
@@ -104,7 +104,7 @@ router.patch('/:id/position', auth, adminAuth, async (req, res) => {
     }
     res.json(machine);
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
@@ -129,7 +129,7 @@ router.delete('/:id', auth, adminAuth, async (req, res) => {
     
     res.json({ message: 'Machine and all related data deleted successfully' });
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 

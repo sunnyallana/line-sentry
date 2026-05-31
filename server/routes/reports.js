@@ -33,7 +33,7 @@ router.post('/generate', auth, async (req, res) => {
 
     res.json(report);
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
@@ -89,7 +89,7 @@ router.get('/', auth, async (req, res) => {
 
     res.json(reports);
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
@@ -114,7 +114,7 @@ router.post('/:id/email', auth, async (req, res) => {
 
     res.json({ message: 'Report emailed successfully' });
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
@@ -135,7 +135,7 @@ router.get('/:id/pdf', auth, async (req, res) => {
     res.setHeader('Content-Disposition', `attachment; filename="${report.type}-report-${report.period.start.toISOString().split('T')[0]}.pdf"`);
     res.send(pdfBuffer);
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
@@ -148,7 +148,7 @@ router.delete('/:id', auth, adminAuth, async (req, res) => {
     }
     res.json({ message: 'Report deleted successfully' });
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 

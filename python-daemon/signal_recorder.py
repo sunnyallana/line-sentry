@@ -6,6 +6,7 @@ Industrial IoT Pin Signal Daemon (PLC Version)
 import asyncio
 import logging
 import json
+import os
 import time
 from datetime import datetime
 import signal
@@ -93,8 +94,15 @@ class SignalDaemon:
             slot=self.config['plc']['slot']
         )
         self.running = False
-        self.backend_url = self.config['backend']['url']
-        
+        # Env vars take precedence over config.json so secrets stay out of the file.
+        self.backend_url = os.environ.get('BACKEND_URL') or self.config['backend']['url']
+        self.api_key = os.environ.get('DAEMON_API_KEY') or self.config['daemon'].get('api_key', '')
+        if not self.api_key:
+            logger.warning(
+                "No DAEMON_API_KEY set (env or config.json). The backend will reject "
+                "ingestion with 401 once API-key auth is enabled."
+            )
+
         # Setup signal handlers for graceful shutdown
         signal.signal(signal.SIGINT, self.signal_handler)
         signal.signal(signal.SIGTERM, self.signal_handler)
@@ -151,10 +159,12 @@ class SignalDaemon:
             
             # Get timeout from config with default fallback
             timeout = self.config['daemon'].get('request_timeout', 10)
-            
+
+            headers = {'X-API-Key': self.api_key} if self.api_key else {}
             response = requests.post(
                 f"{self.backend_url}/api/signals/pin-data",
                 json=payload,
+                headers=headers,
                 timeout=timeout
             )
             

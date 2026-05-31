@@ -1,5 +1,19 @@
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 const User = require('../models/User');
+
+// Guards machine-to-machine endpoints (the PLC daemon's signal ingestion).
+// Compares the X-API-Key header to DAEMON_API_KEY in constant time.
+const apiKeyAuth = (req, res, next) => {
+  const provided = req.header('X-API-Key') || '';
+  const expected = process.env.DAEMON_API_KEY || '';
+  const a = Buffer.from(provided);
+  const b = Buffer.from(expected);
+  if (!expected || a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+    return res.status(401).json({ message: 'Invalid or missing API key.' });
+  }
+  next();
+};
 
 const auth = async (req, res, next) => {
   try {
@@ -30,4 +44,4 @@ const adminAuth = (req, res, next) => {
   next();
 };
 
-module.exports = { auth, adminAuth };
+module.exports = { auth, adminAuth, apiKeyAuth };

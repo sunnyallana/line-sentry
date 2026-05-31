@@ -1,5 +1,9 @@
 import { io, Socket } from 'socket.io-client';
 
+// Socket server URL. Falls back to localhost for local dev; set VITE_SOCKET_URL
+// in production (see .env.example).
+const SOCKET_URL = import.meta.env.VITE_SOCKET_URL || 'http://localhost:3001';
+
 class SocketService {
   private socket: Socket | null = null;
   private listeners: Map<string, Function[]> = new Map();
@@ -7,7 +11,7 @@ class SocketService {
   connect() {
     if (this.socket?.connected) return;
 
-    this.socket = io('http://localhost:3001', {
+    this.socket = io(SOCKET_URL, {
       transports: ['websocket', 'polling']
     });
 

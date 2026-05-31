@@ -1,6 +1,7 @@
 const express = require('express');
 const User = require('../models/User');
 const { auth, adminAuth } = require('../middleware/auth');
+const { safeSearchRegex } = require('../utils/sanitize');
 
 const router = express.Router();
 
@@ -21,7 +22,7 @@ router.get('/', auth, async (req, res) => {
 
     res.json(users);
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
@@ -47,11 +48,12 @@ router.get('/admin/all', auth, adminAuth, async (req, res) => {
     // Build search query
     let query = {};
 
-    // Text search across username, email
-    if (search.trim()) {
+    // Text search across username, email (escaped to prevent NoSQL/ReDoS injection)
+    const searchRegex = safeSearchRegex(search);
+    if (searchRegex) {
       query.$or = [
-        { username: { $regex: search, $options: 'i' } },
-        { email: { $regex: search, $options: 'i' } }
+        { username: searchRegex },
+        { email: searchRegex }
       ];
     }
 
@@ -113,7 +115,7 @@ router.get('/admin/all', auth, adminAuth, async (req, res) => {
       }
     });
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
@@ -152,7 +154,7 @@ router.post('/', auth, adminAuth, async (req, res) => {
       }
     }
     
-    res.status(500).json({ message, error: error.message });
+    res.status(500).json({ message });
   }
 });
 
@@ -221,7 +223,7 @@ router.put('/:id', auth, adminAuth, async (req, res) => {
       }
     }
     
-    res.status(500).json({ message, error: error.message });
+    res.status(500).json({ message });
   }
 });
 
@@ -240,7 +242,7 @@ router.delete('/:id', auth, adminAuth, async (req, res) => {
     }
     res.json({ message: 'User deleted successfully' });
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 

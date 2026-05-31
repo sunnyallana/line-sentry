@@ -1,6 +1,7 @@
 const express = require('express');
 const Mold = require('../models/Mold');
 const { auth, adminAuth } = require('../middleware/auth');
+const { safeSearchRegex } = require('../utils/sanitize');
 
 const router = express.Router();
 
@@ -16,7 +17,7 @@ router.get('/', auth, async (req, res) => {
     const molds = await Mold.find(query).populate('departmentId').lean();
     res.json(molds);
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
@@ -42,11 +43,12 @@ router.get('/admin/all', auth, adminAuth, async (req, res) => {
     let pipeline = [];
     let matchStage = {};
 
-    // Text search across name, description
-    if (search.trim()) {
+    // Text search across name, description (escaped to prevent NoSQL/ReDoS injection)
+    const searchRegex = safeSearchRegex(search);
+    if (searchRegex) {
       matchStage.$or = [
-        { name: { $regex: search, $options: 'i' } },
-        { description: { $regex: search, $options: 'i' } }
+        { name: searchRegex },
+        { description: searchRegex }
       ];
     }
 
@@ -121,7 +123,7 @@ router.get('/admin/all', auth, adminAuth, async (req, res) => {
       }
     });
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
@@ -132,7 +134,7 @@ router.post('/', auth, adminAuth, async (req, res) => {
     await mold.save();
     res.status(201).json(mold);
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
@@ -151,7 +153,7 @@ router.put('/:id', auth, adminAuth, async (req, res) => {
     
     res.json(mold);
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
@@ -164,7 +166,7 @@ router.delete('/:id', auth, adminAuth, async (req, res) => {
     }
     res.json({ message: 'Mold deleted successfully' });
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
@@ -184,7 +186,7 @@ router.patch('/:id/status', auth, adminAuth, async (req, res) => {
       mold
     });
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 

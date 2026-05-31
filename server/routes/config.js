@@ -14,7 +14,7 @@ router.get('/shifts', auth, async (req, res) => {
     res.json(config.shifts);
   } catch (error) { 
     console.error('Shift config fetch error:', error);
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
@@ -31,7 +31,7 @@ router.get('/', auth, adminAuth, async (req, res) => {
     res.json(config);
   } catch (error) { 
     console.error('Config fetch error:', error);
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
@@ -54,7 +54,7 @@ router.put('/', auth, adminAuth, async (req, res) => {
     res.json(config);
   } catch (error) {
     console.error('Config update error:', error);
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 

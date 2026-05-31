@@ -4,6 +4,7 @@ const SensorPinMapping = require('../models/SensorPinMapping');
 const { auth, adminAuth } = require('../middleware/auth');
 const Machine = require('../models/Machine');
 const mongoose = require('mongoose');
+const { safeSearchRegex } = require('../utils/sanitize');
 
 const router = express.Router();
 
@@ -13,7 +14,7 @@ router.get('/', auth, async (req, res) => {
     const sensors = await Sensor.find({ isActive: true }).populate('machineId').lean();
     res.json(sensors);
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
@@ -42,11 +43,12 @@ router.get('/admin/all', auth, adminAuth, async (req, res) => {
     // Match stage for filtering
     let matchStage = {};
     
-    if (search.trim()) {
+    const searchRegex = safeSearchRegex(search);
+    if (searchRegex) {
       matchStage.$or = [
-        { name: { $regex: search, $options: 'i' } },
-        { description: { $regex: search, $options: 'i' } },
-        { sensorType: { $regex: search, $options: 'i' } }
+        { name: searchRegex },
+        { description: searchRegex },
+        { sensorType: searchRegex }
       ];
     }
 
@@ -142,7 +144,7 @@ router.get('/admin/all', auth, adminAuth, async (req, res) => {
       }
     });
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
@@ -155,7 +157,7 @@ router.get('/machine/:machineId', auth, async (req, res) => {
     }).populate('machineId').lean();
     res.json(sensors);
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
@@ -166,7 +168,7 @@ router.post('/', auth, adminAuth, async (req, res) => {
     await sensor.save();
     res.status(201).json(sensor);
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
@@ -185,7 +187,7 @@ router.put('/:id', auth, adminAuth, async (req, res) => {
     
     res.json(sensor);
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
@@ -203,7 +205,7 @@ router.delete('/:id', auth, adminAuth, async (req, res) => {
     
     res.json({ message: 'Sensor permanently deleted' });
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
@@ -228,7 +230,7 @@ router.post('/pin-mapping', auth, adminAuth, async (req, res) => {
     await mapping.save();
     res.status(201).json(mapping);
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
@@ -259,7 +261,7 @@ router.get('/pin-mappings', auth, adminAuth, async (req, res) => {
     ]);
     res.json(mappings);
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
@@ -274,7 +276,7 @@ router.delete('/pin-mapping/:id', auth, adminAuth, async (req, res) => {
     
     res.json({ message: 'Pin mapping permanently deleted' });
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 

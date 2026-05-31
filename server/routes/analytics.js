@@ -407,7 +407,7 @@ router.get('/production-timeline/:machineId', auth, async (req, res) => {
       endDate: formatDate(endDate)
     });
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
@@ -513,7 +513,7 @@ router.post('/stoppage', auth, async (req, res) => {
     res.status(201).json({ message: 'Stoppage recorded' });
   } catch (error) {
     console.error('Stoppage error:', error);
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
@@ -710,7 +710,7 @@ router.post('/production-assignment', auth, async (req, res) => {
     res.json({ message: 'Production assignment updated successfully' });
   } catch (error) {
     console.error('Error saving assignment:', error);
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
@@ -743,7 +743,7 @@ router.get('/machine-stats/:machineId', auth, async (req, res) => {
     const stats = await calculateMachineStats(machineId, start, end);
     res.json({ ...stats, currentStatus: machine.status });
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
@@ -783,7 +783,7 @@ router.get('/department-stats/:departmentId', auth, async (req, res) => {
 
     res.json({ avgOEE });
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
@@ -857,7 +857,7 @@ router.get('/factory-stats', auth, async (req, res) => {
       activeMachines
     });
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 

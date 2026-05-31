@@ -3,6 +3,7 @@ const Department = require('../models/Department');
 const Machine = require('../models/Machine');
 const Molds = require('../models/Mold');
 const { auth, adminAuth } = require('../middleware/auth');
+const { safeSearchRegex } = require('../utils/sanitize');
 
 const router = express.Router();
 
@@ -48,7 +49,7 @@ router.get('/', auth, async (req, res) => {
     const departments = await Department.aggregate(pipeline);
     res.json(departments);
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
@@ -72,11 +73,12 @@ router.get('/admin/all', auth, adminAuth, async (req, res) => {
     // Build search query
     let query = {};
 
-    // Text search across name, description
-    if (search.trim()) {
+    // Text search across name, description (escaped to prevent NoSQL/ReDoS injection)
+    const searchRegex = safeSearchRegex(search);
+    if (searchRegex) {
       query.$or = [
-        { name: { $regex: search, $options: 'i' } },
-        { description: { $regex: search, $options: 'i' } }
+        { name: searchRegex },
+        { description: searchRegex }
       ];
     }
 
@@ -147,7 +149,7 @@ router.get('/admin/all', auth, adminAuth, async (req, res) => {
       }
     });
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
@@ -171,7 +173,7 @@ router.get('/:id', auth, async (req, res) => {
       machines
     });
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
@@ -182,7 +184,7 @@ router.post('/', auth, adminAuth, async (req, res) => {
     await department.save();
     res.status(201).json(department);
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
@@ -199,7 +201,7 @@ router.put('/:id', auth, adminAuth, async (req, res) => {
     }
     res.json(department);
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
@@ -218,7 +220,7 @@ router.get('/admin/all', auth, adminAuth, async (req, res) => {
 
     res.json(departmentsWithCounts);
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
@@ -242,7 +244,7 @@ router.delete('/:id', auth, adminAuth, async (req, res) => {
 
     res.json({ message: 'Department, associated machines, and associated molds deleted successfully' });
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 

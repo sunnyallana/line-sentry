@@ -5,7 +5,8 @@
   "daemon": {
     "interval_seconds": 2,
     "retry_attempts": 3,
-    "retry_delay": 5
+    "retry_delay": 5,
+    "api_key": ""
   },
   "logging": {
     "level": "INFO"

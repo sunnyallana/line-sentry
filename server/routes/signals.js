@@ -4,7 +4,7 @@ const SignalData = require('../models/SignalData');
 const SensorPinMapping = require('../models/SensorPinMapping');
 const ProductionRecord = require('../models/ProductionRecord');
 const Config = require('../models/Config');
-const { auth } = require('../middleware/auth');
+const { auth, apiKeyAuth } = require('../middleware/auth');
 const Machine = require('../models/Machine');
 
 const router = express.Router();
@@ -17,6 +17,22 @@ const machineStates = new Map(); // Track machine states
 const pendingStoppages = new Map(); // Track machines with pending stoppages
 const machineRunningMinutes = new Map(); // Track running minutes per machine
 const unclassifiedStoppages = new Map(); // Track unclassified stoppages
+
+// Idempotency cache: a daemon retry resends the same {timestamp, pinData}. Without
+// dedup, unit-cycle pulses get counted twice. Remember recently-seen payloads briefly.
+const recentPayloads = new Map(); // key -> expiry epoch ms
+const DEDUP_TTL_MS = 30 * 1000;
+function isDuplicatePayload(key) {
+  const now = Date.now();
+  // Opportunistic cleanup so the map can't grow unbounded.
+  if (recentPayloads.size > 5000) {
+    for (const [k, exp] of recentPayloads) if (exp <= now) recentPayloads.delete(k);
+  }
+  const exp = recentPayloads.get(key);
+  if (exp && exp > now) return true;
+  recentPayloads.set(key, now + DEDUP_TTL_MS);
+  return false;
+}
 
 // Get configuration for timeouts
 const getSignalTimeouts = async () => {
@@ -32,14 +48,20 @@ const getSignalTimeouts = async () => {
   }
 };
 
-// Process pin data from daemon
-router.post('/pin-data', async (req, res) => {
+// Process pin data from daemon (machine-to-machine; guarded by API key)
+router.post('/pin-data', apiKeyAuth, async (req, res) => {
   try {
     const { pinData, timestamp } = req.body;
     const io = req.app.get('io');
-    
-    if (!pinData) {
-      return res.status(400).json({ message: 'Pin data is required' });
+
+    // Validate: pinData must be a 1-byte hex string (00..ff).
+    if (typeof pinData !== 'string' || !/^[0-9a-fA-F]{1,2}$/.test(pinData)) {
+      return res.status(400).json({ message: 'pinData must be a hex byte string (e.g. "0f")' });
+    }
+
+    // Idempotency: drop exact retries so unit cycles aren't double-counted.
+    if (isDuplicatePayload(`${timestamp || ''}:${pinData}`)) {
+      return res.json({ message: 'Duplicate payload ignored', processedMachines: [] });
     }
 
     // Convert hex string to byte
@@ -139,10 +161,6 @@ router.post('/pin-data', async (req, res) => {
         }
       }
 
-      setInterval(() => {
-          updateOngoingStoppages(new Date(), io); // Pass io here
-      }, 60000);
-      
       // Update machine last activity
       machineLastActivity.set(machine._id.toString(), currentTime);
     }
@@ -157,7 +175,7 @@ router.post('/pin-data', async (req, res) => {
 
   } catch (error) {
     console.error('Error processing pin data:', error);
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
@@ -478,7 +496,7 @@ async function updateOngoingStoppages(currentTime, io) { // FIX: Add io paramete
 }
 
 // Get unclassified stoppages count for dashboard
-router.get('/unclassified-stoppages-count', async (req, res) => {
+router.get('/unclassified-stoppages-count', auth, async (req, res) => {
   try {
     // Optimized aggregation pipeline
     const result = await ProductionRecord.aggregate([
@@ -515,7 +533,7 @@ router.get('/unclassified-stoppages-count', async (req, res) => {
     
     res.json({ count: result[0]?.total || 0 });
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
@@ -599,12 +617,12 @@ router.get('/machine/:machineId/recent', auth, async (req, res) => {
 
     res.json(signals);
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
 // Add/update signal data
-router.post('/', async (req, res) => {
+router.post('/', auth, async (req, res) => {
   try {
     const { sensorId, machineId, value, timestamp } = req.body;
     
@@ -621,8 +639,20 @@ router.post('/', async (req, res) => {
 
     res.status(201).json({ message: 'Signal data updated successfully' });
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
+// Single global monitor that ticks ongoing unclassified-stoppage durations.
+// Started once from server/index.js after Socket.IO is ready (this replaces the
+// per-request setInterval that previously leaked one timer per pin per request).
+let stoppageMonitor = null;
+function startStoppageMonitor(io) {
+  if (stoppageMonitor) return stoppageMonitor;
+  stoppageMonitor = setInterval(() => updateOngoingStoppages(new Date(), io), 60000);
+  if (typeof stoppageMonitor.unref === 'function') stoppageMonitor.unref();
+  return stoppageMonitor;
+}
+
 module.exports = router;
+module.exports.startStoppageMonitor = startStoppageMonitor;

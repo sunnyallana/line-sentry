@@ -9,6 +9,7 @@ via HTTP requests. It simulates PLC digital input signals for testing purposes.
 import asyncio
 import logging
 import json
+import os
 import time
 import random
 from datetime import datetime
@@ -92,7 +93,9 @@ class SignalDaemon:
         self.config = self.load_config(config_file)
         self.generator = PinSignalGenerator()
         self.running = False
-        self.backend_url = self.config.get('backend', {}).get('url', 'http://localhost:3001')
+        # Env vars take precedence over config.json so secrets stay out of the file.
+        self.backend_url = os.environ.get('BACKEND_URL') or self.config.get('backend', {}).get('url', 'http://localhost:3001')
+        self.api_key = os.environ.get('DAEMON_API_KEY') or self.config.get('daemon', {}).get('api_key', '')
         
         # Setup signal handlers for graceful shutdown
         signal.signal(signal.SIGINT, self.signal_handler)
@@ -148,9 +151,11 @@ class SignalDaemon:
                 'timestamp': datetime.now().isoformat()
             }
             
+            headers = {'X-API-Key': self.api_key} if self.api_key else {}
             response = requests.post(
                 f"{self.backend_url}/api/signals/pin-data",
                 json=payload,
+                headers=headers,
                 timeout=10
             )
             

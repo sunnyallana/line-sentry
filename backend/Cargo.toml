@@ -1,0 +1,45 @@
+[package]
+name = "linesentry-backend"
+version = "0.1.0"
+edition = "2021"
+description = "LineSentry backend — real-time industrial machine analytics API (Axum + MongoDB + Socket.IO)"
+license = "MIT"
+
+[dependencies]
+# Web framework + async runtime
+axum = { version = "0.8", features = ["macros"] }
+tokio = { version = "1", features = ["full"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "compression-full", "trace", "limit"] }
+
+# Database
+mongodb = "3"
+bson = { version = "2", features = ["chrono-0_4"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Auth & crypto
+jsonwebtoken = "9"
+bcrypt = "0.16"
+
+# Real-time
+socketioxide = { version = "0.16", features = ["state"] }
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Errors & utils
+thiserror = "2"
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+dotenvy = "0.15"
+futures = "0.3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
