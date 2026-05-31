@@ -49,8 +49,7 @@ fn fmt_date(d: DateTime<Utc>) -> String {
     d.format("%Y-%m-%d").to_string()
 }
 
-fn get_date_range(tf: &str) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
-    let now = Utc::now();
+fn get_date_range(tf: &str, now: DateTime<Utc>) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
     match tf {
         "today" => Some((
             now.date_naive().and_hms_opt(0, 0, 0).unwrap().and_utc(),
@@ -390,7 +389,7 @@ pub async fn production_timeline(
             _ => return Err(AppError::bad_request("Invalid timeframe or missing dates")),
         }
     } else {
-        get_date_range(&timeframe)
+        get_date_range(&timeframe, state.config.factory_now())
             .ok_or_else(|| AppError::bad_request("Invalid timeframe or missing dates"))?
     };
     if start > end {
@@ -398,10 +397,13 @@ pub async fn production_timeline(
     }
     assert_machine_access(&state, &user, oid).await?;
 
+    // Bound the query to whole days so a `YYYY-MM-DD` end date includes the full
+    // end day (parse_date yields midnight; without day_end the end day is excluded
+    // and a single-day custom range matches nothing).
     let recs: Vec<ProductionRecord> = state
         .db
         .collection::<ProductionRecord>(PRODUCTION_RECORDS)
-        .find(doc! { "machineId": oid, "startTime": { "$gte": bson::DateTime::from_chrono(start), "$lte": bson::DateTime::from_chrono(end) } })
+        .find(doc! { "machineId": oid, "startTime": { "$gte": day_start(start), "$lte": day_end(end) } })
         .await?
         .try_collect()
         .await?;

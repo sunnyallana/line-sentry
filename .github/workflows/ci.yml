@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    name: Frontend (typecheck · build · lint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - name: Typecheck
+        run: npx tsc -p tsconfig.app.json --noEmit
+      - name: Build
+        run: npm run build
+      - name: Lint
+        run: npm run lint
+        continue-on-error: true # pre-existing `any`s; tightened as components migrate
+
+  backend:
+    name: Backend (fmt · clippy · test · build)
+    runs-on: ubuntu-latest
+    services:
+      mongo:
+        image: mongo:7
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.runCommand({ ping: 1 })'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      # Integration tests connect here (each test uses its own throwaway DB).
+      MONGODB_TEST_URI: mongodb://localhost:27017
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: backend
+      - run: cargo fmt --manifest-path backend/Cargo.toml --check
+      - run: cargo clippy --manifest-path backend/Cargo.toml --all-targets
+      - run: cargo test --manifest-path backend/Cargo.toml
+      - run: cargo build --manifest-path backend/Cargo.toml --release
+
+  daemon:
+    name: Daemon (fmt · build · plc)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: daemon
+      - run: cargo fmt --manifest-path daemon/Cargo.toml --check
+      - run: cargo clippy --manifest-path daemon/Cargo.toml
+      - run: cargo build --manifest-path daemon/Cargo.toml
+      - name: Build with PLC (S7) feature
+        run: cargo build --manifest-path daemon/Cargo.toml --features plc

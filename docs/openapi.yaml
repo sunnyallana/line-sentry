@@ -1,0 +1,358 @@
+openapi: 3.0.3
+info:
+  title: LineSentry API
+  version: 1.0.0
+  description: >
+    Real-time industrial machine analytics API. Most endpoints require a JWT
+    bearer token; the signal-ingestion endpoint requires the daemon API key.
+servers:
+  - url: http://localhost:3001/api
+    description: Local dev
+  - url: /api
+    description: Production (same origin, behind nginx)
+
+tags:
+  - name: Auth
+  - name: Signals
+  - name: Departments
+  - name: Machines
+  - name: Sensors
+  - name: PLCs
+  - name: Molds
+  - name: Users
+  - name: Config
+  - name: Analytics
+  - name: Reports
+  - name: System
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+    apiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+  schemas:
+    Error:
+      type: object
+      properties:
+        message: { type: string }
+    LoginRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username: { type: string }
+        password: { type: string, format: password }
+        captchaToken: { type: string, nullable: true }
+    LoginResponse:
+      type: object
+      properties:
+        token: { type: string }
+        user:
+          type: object
+          properties:
+            id: { type: string }
+            username: { type: string }
+            email: { type: string }
+            role: { type: string, enum: [admin, operator] }
+            department: { nullable: true, type: object }
+    PinData:
+      type: object
+      required: [pinData]
+      properties:
+        plcId: { type: string, default: default, description: "Which PLC posted this byte (registry plcId). Defaults to \"default\"." }
+        pinData: { type: string, example: "0f1a", description: "Hex string of one or more output bytes; byte b, bit i = pin Q{b}.{i} (8 x N pins)." }
+        timestamp: { type: string, format: date-time }
+    PinDataResult:
+      type: object
+      properties:
+        message: { type: string }
+        processedMachines:
+          type: array
+          items: { type: string }
+    MachineStats:
+      type: object
+      properties:
+        oee: { type: integer }
+        availability: { type: integer }
+        quality: { type: integer }
+        performance: { type: integer }
+        mtbf: { type: integer }
+        mttr: { type: integer }
+        totalUnitsProduced: { type: number }
+        totalDefectiveUnits: { type: number }
+        currentStatus: { type: string }
+    Plc:
+      type: object
+      required: [plcId, name]
+      properties:
+        plcId: { type: string, example: line-1, description: "Stable slug the daemon posts under (immutable after creation)" }
+        name: { type: string }
+        ip: { type: string, nullable: true }
+        rack: { type: integer, default: 0 }
+        slot: { type: integer, default: 1 }
+        byteCount: { type: integer, default: 1, description: "Output bytes read per tick -> 8 x byteCount pins (Q0.0 ...)" }
+        isActive: { type: boolean, default: true }
+    Signal:
+      type: object
+      required: [pinId, role]
+      properties:
+        plcId: { type: string, default: default, description: "Registry plcId the pin belongs to" }
+        pinId: { type: string, example: Q0.4, description: "Siemens byte.bit address" }
+        role: { type: string, enum: [power, unit-cycle] }
+    SetupMachine:
+      type: object
+      properties:
+        machineId: { type: string }
+        name: { type: string }
+        departmentName: { type: string }
+        powerMapped: { type: boolean }
+        cycleMapped: { type: boolean }
+        departmentHasMold: { type: boolean }
+        ready: { type: boolean }
+    Paginated:
+      type: object
+      properties:
+        pagination:
+          type: object
+          properties:
+            currentPage: { type: integer }
+            totalPages: { type: integer }
+            limit: { type: integer }
+            hasNextPage: { type: boolean }
+            hasPrevPage: { type: boolean }
+  responses:
+    Unauthorized:
+      description: Missing/invalid credentials
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    Forbidden:
+      description: Insufficient role
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+security:
+  - bearerAuth: []
+
+paths:
+  /health:
+    get:
+      tags: [System]
+      summary: Liveness + DB status
+      security: []
+      responses:
+        '200': { description: OK }
+        '503': { description: DB unreachable }
+
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Authenticate, returns a JWT
+      security: []
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/LoginRequest' } } }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/LoginResponse' } } } }
+        '400': { description: Validation/CAPTCHA failure }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { description: Too many login attempts }
+  /auth/me:
+    get:
+      tags: [Auth]
+      summary: Current authenticated user
+      responses:
+        '200': { description: OK }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /auth/init-demo:
+    post:
+      tags: [Auth]
+      summary: Seed demo accounts (disabled in production)
+      security: []
+      responses:
+        '200': { description: Seeded }
+        '403': { description: Disabled in production }
+
+  /signals/pin-data:
+    post:
+      tags: [Signals]
+      summary: Ingest a PLC digital byte (daemon → backend)
+      security: [{ apiKeyAuth: [] }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/PinData' } } }
+      responses:
+        '200': { description: Processed, content: { application/json: { schema: { $ref: '#/components/schemas/PinDataResult' } } } }
+        '400': { description: Invalid pinData }
+        '401': { description: Invalid/missing API key }
+  /signals/machine/{machineId}/recent:
+    get:
+      tags: [Signals]
+      summary: Latest signal per sensor for a machine (sensor populated)
+      parameters: [{ name: machineId, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: OK }, '401': { $ref: '#/components/responses/Unauthorized' } }
+  /signals/unclassified-stoppages-count:
+    get:
+      tags: [Signals]
+      summary: Count of unclassified stoppages (dashboard)
+      responses: { '200': { description: OK } }
+
+  /departments:
+    get:
+      tags: [Departments]
+      summary: List active departments (operator-scoped) with machine counts
+      parameters: [{ name: limit, in: query, schema: { type: integer } }]
+      responses: { '200': { description: OK } }
+    post:
+      tags: [Departments]
+      summary: Create department (admin)
+      responses: { '201': { description: Created }, '403': { $ref: '#/components/responses/Forbidden' } }
+  /departments/admin/all:
+    get:
+      tags: [Departments]
+      summary: Paginated departments (admin)
+      responses: { '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Paginated' } } } } }
+  /departments/{id}:
+    get: { tags: [Departments], summary: Department + machines, parameters: [{ name: id, in: path, required: true, schema: { type: string } }], responses: { '200': { description: OK }, '404': { description: Not found } } }
+    put: { tags: [Departments], summary: Update (admin), parameters: [{ name: id, in: path, required: true, schema: { type: string } }], responses: { '200': { description: OK } } }
+    delete: { tags: [Departments], summary: Delete + cascade (admin), parameters: [{ name: id, in: path, required: true, schema: { type: string } }], responses: { '200': { description: OK } } }
+
+  /machines:
+    get: { tags: [Machines], summary: All active machines (admin), responses: { '200': { description: OK } } }
+    post: { tags: [Machines], summary: Create (admin), responses: { '201': { description: Created } } }
+  /machines/department/{departmentId}:
+    get: { tags: [Machines], summary: Machines in a department (operator-scoped), parameters: [{ name: departmentId, in: path, required: true, schema: { type: string } }], responses: { '200': { description: OK } } }
+  /machines/{id}:
+    get: { tags: [Machines], summary: Machine by id, parameters: [{ name: id, in: path, required: true, schema: { type: string } }], responses: { '200': { description: OK } } }
+    put: { tags: [Machines], summary: Update (admin), parameters: [{ name: id, in: path, required: true, schema: { type: string } }], responses: { '200': { description: OK } } }
+    delete: { tags: [Machines], summary: Delete + cascade (admin), parameters: [{ name: id, in: path, required: true, schema: { type: string } }], responses: { '200': { description: OK } } }
+  /machines/{id}/position:
+    patch: { tags: [Machines], summary: Update position/size (drag-drop, admin), parameters: [{ name: id, in: path, required: true, schema: { type: string } }], responses: { '200': { description: OK } } }
+  /machines/setup-status:
+    get:
+      tags: [Machines]
+      summary: Per-machine setup readiness across the plant (admin)
+      description: For each machine, whether its power + cycle signals are wired and a mold exists in its department (`ready` = all three).
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/SetupMachine' } } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /machines/{id}/signals:
+    get:
+      tags: [Machines]
+      summary: List a machine's wired signals (role, PLC, pin)
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { '200': { description: OK, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Signal' } } } } } }
+    post:
+      tags: [Machines]
+      summary: Wire a signal — creates the sensor and its pin mapping in one step (admin)
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/Signal' } } } }
+      responses:
+        '201': { description: Created }
+        '400': { description: Invalid role, or pin already in use on this PLC }
+        '404': { description: Machine not found }
+  /machines/{id}/signals/{sensorId}:
+    delete:
+      tags: [Machines]
+      summary: Remove a wired signal — deletes the sensor and frees its pin (admin)
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: sensorId, in: path, required: true, schema: { type: string } }
+      responses: { '200': { description: OK }, '404': { description: Not found } }
+
+  /plcs:
+    get:
+      tags: [PLCs]
+      summary: List active PLCs
+      responses: { '200': { description: OK, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Plc' } } } } } }
+    post:
+      tags: [PLCs]
+      summary: Register a PLC (admin)
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/Plc' } } } }
+      responses: { '201': { description: Created }, '400': { description: Missing plcId or duplicate } }
+  /plcs/{id}:
+    put: { tags: [PLCs], summary: Update a PLC (admin; plcId is immutable), parameters: [{ name: id, in: path, required: true, schema: { type: string } }], responses: { '200': { description: OK }, '404': { description: Not found } } }
+    delete: { tags: [PLCs], summary: Remove a PLC (admin; fails if signals are still mapped to it), parameters: [{ name: id, in: path, required: true, schema: { type: string } }], responses: { '200': { description: OK }, '400': { description: PLC still has wired signals } } }
+
+  /sensors:
+    get: { tags: [Sensors], summary: Active sensors (machine populated), responses: { '200': { description: OK } } }
+    post: { tags: [Sensors], summary: Create (admin), responses: { '201': { description: Created } } }
+  /sensors/admin/all:
+    get: { tags: [Sensors], summary: Paginated sensors (admin), responses: { '200': { description: OK } } }
+  /sensors/machine/{machineId}:
+    get: { tags: [Sensors], summary: Sensors for a machine, parameters: [{ name: machineId, in: path, required: true, schema: { type: string } }], responses: { '200': { description: OK } } }
+  /sensors/{id}:
+    put: { tags: [Sensors], summary: Update (admin), parameters: [{ name: id, in: path, required: true, schema: { type: string } }], responses: { '200': { description: OK } } }
+    delete: { tags: [Sensors], summary: Delete (admin), parameters: [{ name: id, in: path, required: true, schema: { type: string } }], responses: { '200': { description: OK } } }
+  /sensors/pin-mapping:
+    post: { tags: [Sensors], summary: Map a sensor to a pin (admin), responses: { '201': { description: Created }, '400': { description: Pin/sensor already mapped } } }
+  /sensors/pin-mappings:
+    get: { tags: [Sensors], summary: List pin mappings (admin), responses: { '200': { description: OK } } }
+  /sensors/pin-mapping/{id}:
+    delete: { tags: [Sensors], summary: Delete a pin mapping (admin), parameters: [{ name: id, in: path, required: true, schema: { type: string } }], responses: { '200': { description: OK } } }
+
+  /molds:
+    get: { tags: [Molds], summary: Active molds (operator-scoped), responses: { '200': { description: OK } } }
+    post: { tags: [Molds], summary: Create (admin), responses: { '201': { description: Created } } }
+  /molds/admin/all:
+    get: { tags: [Molds], summary: Paginated molds (admin), responses: { '200': { description: OK } } }
+  /molds/{id}:
+    put: { tags: [Molds], summary: Update (admin), parameters: [{ name: id, in: path, required: true, schema: { type: string } }], responses: { '200': { description: OK } } }
+    delete: { tags: [Molds], summary: Delete (admin), parameters: [{ name: id, in: path, required: true, schema: { type: string } }], responses: { '200': { description: OK } } }
+  /molds/{id}/status:
+    patch: { tags: [Molds], summary: Toggle active (admin), parameters: [{ name: id, in: path, required: true, schema: { type: string } }], responses: { '200': { description: OK } } }
+
+  /users:
+    get: { tags: [Users], summary: Users (operator-scoped, no passwords), responses: { '200': { description: OK } } }
+    post: { tags: [Users], summary: Create (admin), responses: { '201': { description: Created }, '409': { description: Duplicate username/email } } }
+  /users/admin/all:
+    get: { tags: [Users], summary: Paginated users (admin), responses: { '200': { description: OK } } }
+  /users/{id}:
+    put: { tags: [Users], summary: Update (admin), parameters: [{ name: id, in: path, required: true, schema: { type: string } }], responses: { '200': { description: OK } } }
+    delete: { tags: [Users], summary: Delete (admin), parameters: [{ name: id, in: path, required: true, schema: { type: string } }], responses: { '200': { description: OK } } }
+
+  /config:
+    get: { tags: [Config], summary: Full configuration (admin), responses: { '200': { description: OK } } }
+    put: { tags: [Config], summary: Update configuration (admin), responses: { '200': { description: OK } } }
+  /config/shifts:
+    get: { tags: [Config], summary: Shift definitions, responses: { '200': { description: OK } } }
+
+  /analytics/factory-stats:
+    get: { tags: [Analytics], summary: Factory totals (24h), responses: { '200': { description: OK } } }
+  /analytics/department-stats/{departmentId}:
+    get: { tags: [Analytics], summary: Department avg OEE (24h), parameters: [{ name: departmentId, in: path, required: true, schema: { type: string } }], responses: { '200': { description: OK } } }
+  /analytics/machine-stats/{machineId}:
+    get:
+      tags: [Analytics]
+      summary: Machine OEE/MTTR/MTBF for a date range
+      parameters:
+        - { name: machineId, in: path, required: true, schema: { type: string } }
+        - { name: startDate, in: query, required: true, schema: { type: string } }
+        - { name: endDate, in: query, required: true, schema: { type: string } }
+      responses: { '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/MachineStats' } } } } }
+  /analytics/production-timeline/{machineId}:
+    get:
+      tags: [Analytics]
+      summary: Hourly production timeline
+      parameters:
+        - { name: machineId, in: path, required: true, schema: { type: string } }
+        - { name: timeframe, in: query, schema: { type: string, enum: [today, week, month, custom] } }
+        - { name: startDate, in: query, schema: { type: string } }
+        - { name: endDate, in: query, schema: { type: string } }
+      responses: { '200': { description: OK } }
+  /analytics/stoppage:
+    post: { tags: [Analytics], summary: Classify/add a stoppage (SAP id required for breakdowns), responses: { '201': { description: Recorded }, '400': { description: Invalid SAP number } } }
+  /analytics/production-assignment:
+    post: { tags: [Analytics], summary: Assign operator/mold/defects to hour(s), responses: { '200': { description: OK } } }
+
+  /reports:
+    get: { tags: [Reports], summary: List reports (filterable), responses: { '200': { description: OK } } }
+  /reports/generate:
+    post: { tags: [Reports], summary: Generate a report (metrics + machine/dept/shift breakdowns), responses: { '200': { description: OK } } }
+  /reports/{id}:
+    delete: { tags: [Reports], summary: Delete (admin), parameters: [{ name: id, in: path, required: true, schema: { type: string } }], responses: { '200': { description: OK } } }
+  /reports/{id}/pdf:
+    get: { tags: [Reports], summary: Download report PDF, parameters: [{ name: id, in: path, required: true, schema: { type: string } }], responses: { '200': { description: PDF, content: { application/pdf: {} } } } }
+  /reports/{id}/email:
+    post: { tags: [Reports], summary: Email the report to configured recipients, parameters: [{ name: id, in: path, required: true, schema: { type: string } }], responses: { '200': { description: Sent } } }

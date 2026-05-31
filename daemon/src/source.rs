@@ -26,56 +26,63 @@ impl Source {
         }
     }
 
-    /// Read one digital byte (8 pins, LSB = DQ.0).
-    pub fn read_byte(&mut self) -> anyhow::Result<u8> {
+    /// Read `count` output bytes (8 pins per byte, LSB = bit 0 of byte 0).
+    pub fn read(&mut self, count: usize) -> anyhow::Result<Vec<u8>> {
         match self {
-            Source::Simulator(s) => Ok(s.read_byte()),
+            Source::Simulator(s) => Ok(s.read(count)),
             #[cfg(feature = "plc")]
-            Source::Plc(p) => p.read_byte(),
+            Source::Plc(p) => p.read(count),
         }
     }
 }
 
-/// Generates realistic-looking signals: pins 4–7 act as "power" (held on) and
-/// pins 0–3 as "unit-cycle" sensors that pulse intermittently — so whatever the
-/// backend has mapped reacts. Lets the whole pipeline be exercised without a PLC.
+/// Generates realistic-looking signals across as many bytes as requested: in
+/// each byte, bits 4–7 act as "power" (held on) and bits 0–3 as "unit-cycle"
+/// sensors that pulse intermittently — so whatever the backend has mapped (on
+/// any pin) reacts. Lets the whole pipeline be exercised without a PLC.
 pub struct Simulator {
-    pulse_until: [Option<Instant>; 8],
+    pulse_until: Vec<Option<Instant>>,
 }
 
 impl Simulator {
     pub fn new() -> Self {
-        Self { pulse_until: [None; 8] }
+        Self {
+            pulse_until: Vec::new(),
+        }
     }
 
-    pub fn read_byte(&mut self) -> u8 {
+    pub fn read(&mut self, count: usize) -> Vec<u8> {
         let now = Instant::now();
-        let mut byte: u8 = 0;
-
-        // Power pins (4–7): held on.
-        for i in 4..8 {
-            byte |= 1 << i;
+        if self.pulse_until.len() < count * 8 {
+            self.pulse_until.resize(count * 8, None);
         }
-
-        // Unit-cycle pins (0–3): short pulses.
-        for i in 0..4 {
-            let active = match self.pulse_until[i] {
-                Some(t) if now < t => true,
-                _ => {
-                    if rand::random::<f64>() < 0.30 {
-                        self.pulse_until[i] = Some(now + Duration::from_millis(800));
-                        true
-                    } else {
-                        self.pulse_until[i] = None;
-                        false
+        let mut bytes = vec![0u8; count];
+        for (b, byte) in bytes.iter_mut().enumerate() {
+            // Power pins (bits 4–7): held on.
+            for i in 4..8 {
+                *byte |= 1 << i;
+            }
+            // Unit-cycle pins (bits 0–3): short pulses.
+            for i in 0..4 {
+                let idx = b * 8 + i;
+                let active = match self.pulse_until[idx] {
+                    Some(t) if now < t => true,
+                    _ => {
+                        if rand::random::<f64>() < 0.30 {
+                            self.pulse_until[idx] = Some(now + Duration::from_millis(800));
+                            true
+                        } else {
+                            self.pulse_until[idx] = None;
+                            false
+                        }
                     }
+                };
+                if active {
+                    *byte |= 1 << i;
                 }
-            };
-            if active {
-                byte |= 1 << i;
             }
         }
-        byte
+        bytes
     }
 }
 
@@ -111,18 +118,23 @@ mod plc {
             Ok(())
         }
 
-        /// Read process-outputs (PA) byte 0 — the same byte the Python daemon reads.
-        pub fn read_byte(&mut self) -> anyhow::Result<u8> {
-            let mut buf = [0u8; 1];
-            match self
-                .client
-                .read_area(AreaTable::S7AreaPA, 0, 0, 1, WordLenTable::S7WLByte, &mut buf)
-            {
-                Ok(_) => Ok(buf[0]),
+        /// Read `count` process-output (PA) bytes starting at byte 0 — the same
+        /// area the Python daemon reads, widened to support more pins.
+        pub fn read(&mut self, count: usize) -> anyhow::Result<Vec<u8>> {
+            let mut buf = vec![0u8; count.max(1)];
+            match self.client.read_area(
+                AreaTable::S7AreaPA,
+                0,
+                0,
+                buf.len() as i32,
+                WordLenTable::S7WLByte,
+                &mut buf,
+            ) {
+                Ok(_) => Ok(buf),
                 Err(e) => {
                     tracing::warn!("PLC read failed ({e:?}); attempting reconnect");
                     self.reconnect()?;
-                    Ok(0)
+                    Ok(vec![0u8; count.max(1)])
                 }
             }
         }

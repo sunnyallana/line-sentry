@@ -145,17 +145,30 @@ pub struct GenerateReq {
     machine_id: Option<String>,
 }
 
+/// Parse a date that may be RFC3339 or a plain `YYYY-MM-DD`. `end_of_day`
+/// pushes a bare date to 23:59:59.999 so a single-day report covers the whole day.
+fn parse_report_date(s: &str, end_of_day: bool) -> Option<DateTime<Utc>> {
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Some(dt.with_timezone(&Utc));
+    }
+    let d = chrono::NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d").ok()?;
+    let naive = if end_of_day {
+        d.and_hms_milli_opt(23, 59, 59, 999)?
+    } else {
+        d.and_hms_opt(0, 0, 0)?
+    };
+    Some(naive.and_utc())
+}
+
 pub async fn generate(
     AuthUser(user): AuthUser,
     State(state): State<AppState>,
     Json(b): Json<GenerateReq>,
 ) -> AppResult<Json<Value>> {
-    let start = DateTime::parse_from_rfc3339(&b.start_date)
-        .map(|d| d.with_timezone(&Utc))
-        .map_err(|_| AppError::bad_request("invalid startDate"))?;
-    let end = DateTime::parse_from_rfc3339(&b.end_date)
-        .map(|d| d.with_timezone(&Utc))
-        .map_err(|_| AppError::bad_request("invalid endDate"))?;
+    let start = parse_report_date(&b.start_date, false)
+        .ok_or_else(|| AppError::bad_request("invalid startDate"))?;
+    let end = parse_report_date(&b.end_date, true)
+        .ok_or_else(|| AppError::bad_request("invalid endDate"))?;
     let dept_oid = b
         .department_id
         .as_deref()

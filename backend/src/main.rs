@@ -9,6 +9,9 @@ mod realtime;
 mod routes;
 mod state;
 
+#[cfg(test)]
+mod integration_tests;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -151,11 +154,20 @@ fn build_router(state: AppState) -> Router {
             "/",
             get(routes::machines::list).post(routes::machines::create),
         )
+        .route("/setup-status", get(routes::machines::setup_status))
         .route(
             "/department/{departmentId}",
             get(routes::machines::by_department),
         )
         .route("/{id}/position", patch(routes::machines::position))
+        .route(
+            "/{id}/signals",
+            get(routes::machines::signals_list).post(routes::machines::signals_create),
+        )
+        .route(
+            "/{id}/signals/{sensorId}",
+            delete(routes::machines::signals_delete),
+        )
         .route(
             "/{id}",
             get(routes::machines::get_one)
@@ -198,6 +210,13 @@ fn build_router(state: AppState) -> Router {
             put(routes::users::update).delete(routes::users::delete),
         );
 
+    let plc_routes = Router::new()
+        .route("/", get(routes::plcs::list).post(routes::plcs::create))
+        .route(
+            "/{id}",
+            put(routes::plcs::update).delete(routes::plcs::delete),
+        );
+
     let config_routes = Router::new()
         .route("/", get(routes::config::get).put(routes::config::update))
         .route("/shifts", get(routes::config::shifts));
@@ -238,6 +257,7 @@ fn build_router(state: AppState) -> Router {
         .nest("/api/machines", machine_routes)
         .nest("/api/sensors", sensor_routes)
         .nest("/api/molds", mold_routes)
+        .nest("/api/plcs", plc_routes)
         .nest("/api/users", user_routes)
         .nest("/api/config", config_routes)
         .nest("/api/analytics", analytics_routes)

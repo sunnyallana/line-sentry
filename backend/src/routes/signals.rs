@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 
 use crate::auth::{AuthUser, DaemonKey};
 use crate::error::{AppError, AppResult};
-use crate::models::{Id, PRODUCTION_RECORDS, SIGNAL_DATA};
+use crate::models::{Id, DEFAULT_PLC, PRODUCTION_RECORDS, SIGNAL_DATA};
 use crate::pipeline;
 use crate::state::AppState;
 
@@ -24,6 +24,9 @@ pub struct PinDataReq {
     #[serde(rename = "pinData")]
     pin_data: Option<String>,
     timestamp: Option<String>,
+    /// Which PLC posted this byte (registry `plcId`). Defaults to "default".
+    #[serde(rename = "plcId")]
+    plc_id: Option<String>,
 }
 
 /// Ingest one pin byte from the daemon. Guarded by the daemon API key.
@@ -36,7 +39,8 @@ pub async fn pin_data(
     if pin.is_empty() {
         return Err(AppError::bad_request("pinData is required"));
     }
-    let processed = pipeline::process_pin_data(&state, &pin, body.timestamp.as_deref()).await?;
+    let plc_id = body.plc_id.as_deref().filter(|s| !s.is_empty()).unwrap_or(DEFAULT_PLC);
+    let processed = pipeline::process_pin_data(&state, plc_id, &pin, body.timestamp.as_deref()).await?;
     Ok(Json(json!({
         "message": "Pin data processed successfully",
         "processedMachines": processed,

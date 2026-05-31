@@ -63,9 +63,12 @@ export interface SocketEventMap {
   };
 }
 
+/** Internal listener shape — handlers receive the event payload as the first arg. */
+type Listener = (data: unknown) => void;
+
 class SocketService {
   private socket: Socket | null = null;
-  private listeners: Map<string, Function[]> = new Map();
+  private listeners: Map<string, Listener[]> = new Map();
 
   connect() {
     if (this.socket?.connected) return;
@@ -84,7 +87,7 @@ class SocketService {
     // Re-register all listeners
     this.listeners.forEach((callbacks, event) => {
       callbacks.forEach(callback => {
-        this.socket?.on(event, callback as any);
+        this.socket?.on(event, callback);
       });
     });
   }
@@ -96,28 +99,28 @@ class SocketService {
     }
   }
 
-  on(event: string, callback: Function) {
+  on<T = unknown>(event: string, callback: (data: T) => void) {
     if (!this.listeners.has(event)) {
       this.listeners.set(event, []);
     }
-    this.listeners.get(event)!.push(callback);
+    this.listeners.get(event)!.push(callback as Listener);
 
     // Attach whenever a socket exists (handlers may be registered before the
     // 'connect' event fires; socket.io attaches them correctly either way).
     if (this.socket) {
-      this.socket.on(event, callback as any);
+      this.socket.on(event, callback as Listener);
     }
   }
 
-  off(event: string, callback?: Function) {
+  off<T = unknown>(event: string, callback?: (data: T) => void) {
     if (callback) {
       const callbacks = this.listeners.get(event) || [];
-      const index = callbacks.indexOf(callback);
+      const index = callbacks.indexOf(callback as Listener);
       if (index > -1) {
         callbacks.splice(index, 1);
       }
       if (this.socket) {
-        this.socket.off(event, callback as any);
+        this.socket.off(event, callback as Listener);
       }
     } else {
       this.listeners.delete(event);
@@ -139,7 +142,7 @@ class SocketService {
     }
   }
 
-  emit(event: string, data: any) {
+  emit(event: string, data: unknown) {
     if (this.socket?.connected) {
       this.socket.emit(event, data);
     }

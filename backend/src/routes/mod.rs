@@ -7,6 +7,7 @@ pub mod config;
 pub mod departments;
 pub mod machines;
 pub mod molds;
+pub mod plcs;
 pub mod reports;
 pub mod sensors;
 pub mod signals;

@@ -1,5 +1,5 @@
 import React, { useState, useRef } from 'react';
-import { useAuth } from '../context/AuthContext';
+import { useAuth } from '../context/auth-context';
 import { useNavigate } from 'react-router-dom';
 import { Factory, User as UserIcon, Lock, AlertCircle, Shield } from 'lucide-react';
 import ReCAPTCHA from 'react-google-recaptcha';

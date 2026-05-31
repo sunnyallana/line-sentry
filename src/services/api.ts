@@ -61,11 +61,11 @@ class ApiService {
         ...options
       });
       return response.data;
-    } catch (error: any) {
-      if (error.response?.data?.message) {
-        throw new Error(error.response.data.message);
+    } catch (error) {
+      if (axios.isAxiosError(error)) {
+        throw new Error(error.response?.data?.message || error.message || 'Network error');
       }
-      throw new Error(error.message || 'Network error');
+      throw new Error(error instanceof Error ? error.message : 'Network error');
     }
   }
 
@@ -117,14 +117,14 @@ class ApiService {
     });
   }
 
-  async createDepartment(department: any) {
+  async createDepartment(department: Record<string, unknown>) {
     return this.request('/departments', {
       method: 'POST',
       data: department,
     });
   }
 
-  async updateDepartment(id: string, department: any) {
+  async updateDepartment(id: string, department: Record<string, unknown>) {
     return this.request(`/departments/${id}`, {
       method: 'PUT',
       data: department,
@@ -158,14 +158,44 @@ class ApiService {
     return this.request('/machines');
   }
 
-  async createMachine(machine: any) {
+  // Plant-wide setup readiness (per machine: signals wired? mold available?).
+  async getSetupStatus() {
+    return this.request('/machines/setup-status');
+  }
+
+  // Per-machine signal wiring (a "signal" = sensor + PLC pin, in one step).
+  async getMachineSignals(machineId: string) {
+    return this.request(`/machines/${machineId}/signals`);
+  }
+  async createMachineSignal(machineId: string, body: { plcId?: string; pinId: string; role: string }) {
+    return this.request(`/machines/${machineId}/signals`, { method: 'POST', data: body });
+  }
+  async deleteMachineSignal(machineId: string, sensorId: string) {
+    return this.request(`/machines/${machineId}/signals/${sensorId}`, { method: 'DELETE' });
+  }
+
+  // PLC registry — the devices the daemon(s) read from.
+  async getPlcs() {
+    return this.request('/plcs');
+  }
+  async createPlc(body: Record<string, unknown>) {
+    return this.request('/plcs', { method: 'POST', data: body });
+  }
+  async updatePlc(id: string, body: Record<string, unknown>) {
+    return this.request(`/plcs/${id}`, { method: 'PUT', data: body });
+  }
+  async deletePlc(id: string) {
+    return this.request(`/plcs/${id}`, { method: 'DELETE' });
+  }
+
+  async createMachine(machine: Record<string, unknown>) {
     return this.request('/machines', {
       method: 'POST',
       data: machine,
     });
   }
 
-  async updateMachine(id: string, machineData: any) {
+  async updateMachine(id: string, machineData: Record<string, unknown>) {
     return this.request(`/machines/${id}`, {
       method: 'PUT',
       data: machineData,
@@ -215,14 +245,14 @@ class ApiService {
     });
   }
 
-  async createUser(user: any) {
+  async createUser(user: Record<string, unknown>) {
     return this.request('/users', {
       method: 'POST',
       data: user,
     });
   }
 
-  async updateUser(id: string, user: any) {
+  async updateUser(id: string, user: Record<string, unknown>) {
     return this.request(`/users/${id}`, {
       method: 'PUT',
       data: user,
@@ -257,21 +287,21 @@ class ApiService {
     }); 
 }
 
-  async addStoppageRecord(stoppage: any) {
+  async addStoppageRecord(stoppage: Record<string, unknown>) {
     return this.request('/analytics/stoppage', {
       method: 'POST',
       data: stoppage,
     });
   }
 
-  async updateStoppageRecord(id: string, stoppage: any) {
+  async updateStoppageRecord(id: string, stoppage: Record<string, unknown>) {
     return this.request(`/analytics/stoppage/${id}`, {
       method: 'PUT',
       data: stoppage,
     });
   }
 
-  async updateProductionAssignment(data: any) {
+  async updateProductionAssignment(data: Record<string, unknown>) {
     return this.request('/analytics/production-assignment', {
       method: 'POST',
       data: data,
@@ -287,7 +317,7 @@ class ApiService {
     return this.request('/config/shifts');
   }
 
-  async updateConfig(config: any) {
+  async updateConfig(config: Record<string, unknown>) {
     return this.request('/config', {
       method: 'PUT',
       data: config,
@@ -319,14 +349,14 @@ class ApiService {
     });
   }
 
-  async createSensor(sensor: any) {
+  async createSensor(sensor: Record<string, unknown>) {
     return this.request('/sensors', {
       method: 'POST',
       data: sensor,
     });
   }
 
-  async updateSensor(id: string, sensorData: any) {
+  async updateSensor(id: string, sensorData: Record<string, unknown>) {
     return this.request(`/sensors/${id}`, {
       method: 'PUT',
       data: sensorData,
@@ -346,7 +376,7 @@ class ApiService {
     });
   }
 
-  async createPinMapping(mapping: any) {
+  async createPinMapping(mapping: Record<string, unknown>) {
     return this.request('/sensors/pin-mapping', {
       method: 'POST',
       data: mapping,
@@ -377,14 +407,14 @@ class ApiService {
     });
   }
 
-  async createMold(mold: any) {
+  async createMold(mold: Record<string, unknown>) {
     return this.request('/molds', {
       method: 'POST',
       data: mold,
     });
   }
 
-  async updateMold(id: string, moldData: any) {
+  async updateMold(id: string, moldData: Record<string, unknown>) {
     return this.request(`/molds/${id}`, {
       method: 'PUT',
       data: moldData,
@@ -404,14 +434,14 @@ class ApiService {
   }
 
   // Reports
-  async getReports(filters?: any) {
+  async getReports(filters?: Record<string, unknown>) {
     return this.request('/reports', {
       method: 'GET',
       params: filters
     });
   }
 
-  async generateReport(reportData: any) {
+  async generateReport(reportData: Record<string, unknown>) {
     return this.request('/reports/generate', {
       method: 'POST',
       data: reportData,
@@ -445,8 +475,9 @@ class ApiService {
       document.body.removeChild(a);
       
       return { success: true };
-    } catch (error: any) {
-      throw new Error(error.response?.data?.message || 'Failed to download PDF');
+    } catch (error) {
+      const message = axios.isAxiosError(error) ? error.response?.data?.message : undefined;
+      throw new Error(message || 'Failed to download PDF');
     }
   }
 

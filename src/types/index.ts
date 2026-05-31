@@ -11,7 +11,7 @@ export interface Department {
   _id: string;
   name: string;
   description?: string;
-  layout?: any;
+  layout?: Record<string, unknown>;
   machines?: Machine[];
   machineCount: number;
   isActive: boolean;

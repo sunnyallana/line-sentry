@@ -115,11 +115,13 @@ impl PipelineState {
             .filter_map(|s| s.id.map(|id| (id, s)))
             .collect();
 
+        // Key by "{plcId}|{pinId}" so the same pin address on different PLCs
+        // resolves to different sensors/machines.
         let mut map = HashMap::new();
         for m in &mappings {
             if let Some(s) = sensor_by_id.get(&m.sensor_id) {
                 map.insert(
-                    m.pin_id.clone(),
+                    format!("{}|{}", m.plc_id, m.pin_id),
                     PinInfo {
                         sensor_id: m.sensor_id,
                         sensor_type: s.sensor_type.clone(),
@@ -131,6 +133,12 @@ impl PipelineState {
 
         *self.pin_cache.write().unwrap() = Some((Instant::now(), map.clone()));
         Ok(map)
+    }
+
+    /// Drop the cached pin mappings so the next signal reloads them. Call after
+    /// wiring or removing a signal so it takes effect immediately.
+    pub fn invalidate_pin_cache(&self) {
+        *self.pin_cache.write().unwrap() = None;
     }
 }
 
@@ -291,15 +299,23 @@ async fn signal_timeouts(db: &Database) -> (chrono::Duration, chrono::Duration) 
 /// Process one pin-data payload. Returns the machine ids that recorded a unit.
 pub async fn process_pin_data(
     state: &AppState,
+    plc_id: &str,
     pin_data: &str,
     timestamp: Option<&str>,
 ) -> AppResult<Vec<String>> {
-    let byte_value = u8::from_str_radix(pin_data, 16)
-        .map_err(|_| AppError::bad_request("pinData must be a hex byte string (e.g. \"0f\")"))?;
-    let now = parse_timestamp(timestamp);
+    // pinData is a hex string of one or more output bytes (LSB = bit 0). N bytes
+    // expose pins Q0.0 … Q{N-1}.7 — so a PLC scales by reading more bytes.
+    let bytes = decode_hex(pin_data).ok_or_else(|| {
+        AppError::bad_request("pinData must be a hex string of whole bytes (e.g. \"0f\" or \"0f1a\")")
+    })?;
 
-    // Idempotency: drop exact retries so unit cycles aren't double-counted.
-    let dedup_key = format!("{}:{}", timestamp.unwrap_or(""), pin_data);
+    // Shift to factory-local wall-clock so production buckets into the right
+    // hour/day on the floor. Differences between two such values are unchanged,
+    // so signal-timeout / running-minute math stays correct.
+    let now = parse_timestamp(timestamp) + state.config.factory_offset();
+
+    // Idempotency (scoped per PLC): drop exact retries so cycles aren't double-counted.
+    let dedup_key = format!("{}:{}:{}", plc_id, timestamp.unwrap_or(""), pin_data);
     if state.pipeline.is_duplicate(&dedup_key) {
         return Ok(Vec::new());
     }
@@ -309,52 +325,66 @@ pub async fn process_pin_data(
 
     let mut processed: HashSet<String> = HashSet::new();
 
-    for pin_index in 0u8..8 {
-        let pin_id = format!("DQ.{pin_index}");
-        let pin_value = (byte_value >> pin_index) & 1;
-        let info = match pins.get(&pin_id) {
-            Some(i) => i,
-            None => continue,
-        };
-        let machine = info.machine_id.to_hex();
+    for (byte_idx, &byte_value) in bytes.iter().enumerate() {
+        for bit in 0u8..8 {
+            let pin_value = (byte_value >> bit) & 1;
+            // Siemens byte.bit address, scoped to the posting PLC.
+            let info = match pins.get(&format!("{plc_id}|Q{byte_idx}.{bit}")) {
+                Some(i) => i,
+                None => continue,
+            };
+            let machine = info.machine_id.to_hex();
 
-        // Upsert the latest signal value (one per sensor).
-        upsert_signal(
-            &state.db,
-            info.sensor_id,
-            info.machine_id,
-            pin_value as f64,
-            now,
-        )
-        .await?;
+            // Upsert the latest signal value (one per sensor).
+            upsert_signal(&state.db, info.sensor_id, info.machine_id, pin_value as f64, now).await?;
 
-        if info.sensor_type == "power" && pin_value == 1 {
-            state.pipeline.last_power.insert(machine.clone(), now);
-            realtime::broadcast(
-                &state.io,
-                "power-signal",
-                &json!({ "machineId": machine, "value": pin_value, "timestamp": now }),
-            )
-            .await;
-        }
-
-        if info.sensor_type == "unit-cycle" && pin_value == 1 {
-            update_production_record(state, info.machine_id, now).await?;
-            processed.insert(machine.clone());
-            state.pipeline.last_cycle.insert(machine.clone(), now);
-            if state.pipeline.pending_stoppages.contains_key(&machine) {
-                resolve_pending_stoppage(state, info.machine_id, now).await?;
-                state.pipeline.pending_stoppages.remove(&machine);
+            if info.sensor_type == "power" && pin_value == 1 {
+                state.pipeline.last_power.insert(machine.clone(), now);
+                realtime::broadcast(
+                    &state.io,
+                    "power-signal",
+                    &json!({ "machineId": machine, "value": pin_value, "timestamp": now }),
+                )
+                .await;
             }
-        }
 
-        state.pipeline.last_activity.insert(machine.clone(), now);
+            if info.sensor_type == "unit-cycle" && pin_value == 1 {
+                update_production_record(state, info.machine_id, now).await?;
+                processed.insert(machine.clone());
+                state.pipeline.last_cycle.insert(machine.clone(), now);
+                if state.pipeline.pending_stoppages.contains_key(&machine) {
+                    resolve_pending_stoppage(state, info.machine_id, now).await?;
+                    state.pipeline.pending_stoppages.remove(&machine);
+                }
+            }
+
+            state.pipeline.last_activity.insert(machine.clone(), now);
+        }
     }
 
-    let machine_ids: HashSet<Id> = pins.values().map(|p| p.machine_id).collect();
+    // Recompute state only for machines wired to THIS PLC (cost stays O(machines
+    // on this PLC), not O(all machines), as the plant grows to many PLCs).
+    let prefix = format!("{plc_id}|");
+    let machine_ids: HashSet<Id> = pins
+        .iter()
+        .filter(|(k, _)| k.starts_with(&prefix))
+        .map(|(_, v)| v.machine_id)
+        .collect();
     update_machine_states(state, &machine_ids, now, timeouts).await?;
 
     Ok(processed.into_iter().collect())
+}
+
+/// Decode a hex string of whole bytes (even length) into bytes; `None` if malformed.
+fn decode_hex(s: &str) -> Option<Vec<u8>> {
+    let s = s.trim();
+    if s.is_empty() || s.len() % 2 != 0 {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
 }
 
 async fn upsert_signal(

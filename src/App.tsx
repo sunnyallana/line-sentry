@@ -1,6 +1,7 @@
 import React, { Suspense, lazy, useEffect, useState } from 'react';
 import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
-import { AuthProvider, useAuth } from './context/AuthContext';
+import { AuthProvider } from './context/AuthContext';
+import { useAuth } from './context/auth-context';
 import { PageLoader } from './components/ui';
 import Login from './components/Login';
 import Layout from './components/Layout';
@@ -15,6 +16,7 @@ const Sensors = lazy(() => import('./components/Sensors'));
 const Molds = lazy(() => import('./components/Molds'));
 const Configuration = lazy(() => import('./components/Configuration'));
 const Reports = lazy(() => import('./components/Reports'));
+const Setup = lazy(() => import('./components/Setup'));
 
 // Theme context (consumed across components for the dark/light toggle).
 export const ThemeContext = React.createContext<{
@@ -66,6 +68,7 @@ const App: React.FC = () => {
                 <Route path="department/:id" element={<DepartmentView />} />
                 <Route path="machine/:id" element={<MachineView />} />
                 <Route path="users" element={<RequireAdmin><Users /></RequireAdmin>} />
+                <Route path="setup" element={<RequireAdmin><Setup /></RequireAdmin>} />
                 <Route path="sensors" element={<RequireAdmin><Sensors /></RequireAdmin>} />
                 <Route path="molds" element={<RequireAdmin><Molds /></RequireAdmin>} />
                 <Route path="reports" element={<Reports />} />

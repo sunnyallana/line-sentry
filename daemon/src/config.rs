@@ -28,6 +28,10 @@ pub struct Config {
     pub request_timeout: Duration,
     pub source: SourceKind,
     pub plc: PlcConfig,
+    /// Registry id this daemon posts under (the backend scopes pin mappings to it).
+    pub plc_id: String,
+    /// Number of output bytes to read each tick → `8 * byte_count` pins.
+    pub byte_count: usize,
 }
 
 // ── Raw file shape (mirrors python-daemon/config.json) ───────────────────────
@@ -47,7 +51,9 @@ struct BackendFile {
 }
 impl Default for BackendFile {
     fn default() -> Self {
-        Self { url: "http://localhost:3001".into() }
+        Self {
+            url: "http://localhost:3001".into(),
+        }
     }
 }
 
@@ -59,6 +65,8 @@ struct DaemonFile {
     request_timeout: Option<u64>,
     api_key: Option<String>,
     source: Option<String>,
+    plc_id: Option<String>,
+    byte_count: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -78,7 +86,9 @@ impl Config {
         let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
 
         let backend_url = env("BACKEND_URL").unwrap_or(file.backend.url);
-        let api_key = env("DAEMON_API_KEY").or(file.daemon.api_key).unwrap_or_default();
+        let api_key = env("DAEMON_API_KEY")
+            .or(file.daemon.api_key)
+            .unwrap_or_default();
 
         let interval_secs = env("INTERVAL_SECONDS")
             .and_then(|v| v.parse().ok())
@@ -97,10 +107,27 @@ impl Config {
         };
 
         let plc = PlcConfig {
-            ip: env("PLC_IP").or_else(|| file.plc.as_ref().map(|p| p.ip.clone())).unwrap_or_else(|| "192.168.0.1".into()),
-            rack: env("PLC_RACK").and_then(|v| v.parse().ok()).or_else(|| file.plc.as_ref().map(|p| p.rack)).unwrap_or(0),
-            slot: env("PLC_SLOT").and_then(|v| v.parse().ok()).or_else(|| file.plc.as_ref().map(|p| p.slot)).unwrap_or(1),
+            ip: env("PLC_IP")
+                .or_else(|| file.plc.as_ref().map(|p| p.ip.clone()))
+                .unwrap_or_else(|| "192.168.0.1".into()),
+            rack: env("PLC_RACK")
+                .and_then(|v| v.parse().ok())
+                .or_else(|| file.plc.as_ref().map(|p| p.rack))
+                .unwrap_or(0),
+            slot: env("PLC_SLOT")
+                .and_then(|v| v.parse().ok())
+                .or_else(|| file.plc.as_ref().map(|p| p.slot))
+                .unwrap_or(1),
         };
+
+        let plc_id = env("PLC_ID")
+            .or(file.daemon.plc_id)
+            .unwrap_or_else(|| "default".into());
+        let byte_count = env("BYTE_COUNT")
+            .and_then(|v| v.parse().ok())
+            .or(file.daemon.byte_count)
+            .unwrap_or(1)
+            .max(1);
 
         Config {
             backend_url,
@@ -111,6 +138,8 @@ impl Config {
             request_timeout: Duration::from_secs(file.daemon.request_timeout.unwrap_or(10)),
             source,
             plc,
+            plc_id,
+            byte_count,
         }
     }
 }

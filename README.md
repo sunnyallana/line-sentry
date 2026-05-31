@@ -1,164 +1,190 @@
-# LineSentry - Real-Time Machine Analytics Platform
+<div align="center">
 
-## Table of Contents
-- [Overview](#overview)
-- [Problem Statement](#problem-statement)
-- [Solution](#solution)
-- [Key Features](#key-features)
-- [System Architecture](#system-architecture)
-- [Security](#security)
-- [Future Improvements](#future-improvements)
-- [Installation & Setup](#installation--setup)
-- [Usage](#usage)
+# LineSentry
+
+### Real-time OEE · MTTR · MTBF analytics for the factory floor
+
+Ingest PLC signals at the edge, compute live machine metrics, classify stoppages,
+and drive real-time dashboards — an open, vendor-neutral alternative to costly,
+inflexible legacy systems.
+
+![Rust](https://img.shields.io/badge/Backend-Rust%20·%20Axum-000000?logo=rust&logoColor=white)
+![React](https://img.shields.io/badge/Frontend-React%2018%20·%20TS-61DAFB?logo=react&logoColor=black)
+![MongoDB](https://img.shields.io/badge/Data-MongoDB-47A248?logo=mongodb&logoColor=white)
+![Socket.IO](https://img.shields.io/badge/Realtime-Socket.IO-010101?logo=socketdotio&logoColor=white)
+![Docker](https://img.shields.io/badge/Deploy-Docker%20Compose-2496ED?logo=docker&logoColor=white)
+![License](https://img.shields.io/badge/License-MIT-blue)
+
+</div>
+
+---
+
+> Built for Dawlance to monitor injection-molding and assembly lines — generic
+> enough for **any** machine that exposes digital signals through a PLC, and
+> scalable from a single machine to **hundreds across many PLCs**.
+
+## Highlights
+
+| | |
+|---|---|
+| **Scales to many PLCs** | A PLC registry plus a per-PLC dynamic pin space (`Q0.0…Q{n}.7`). Map signals to machines across one device or hundreds. |
+| **Guided setup** | A readiness checklist wires each machine's power + cycle signals in one step, and shows exactly what's left before metrics go live. |
+| **Live OEE / MTTR / MTBF** | Availability × performance × quality, computed per machine, department, and factory over any timeframe. |
+| **Real-time timeline** | Hour-by-hour production with operator/mold assignment and stoppage classification, streamed over Socket.IO. |
+| **Rust core** | Axum backend + Tokio edge daemon — memory-safe, fast, and integration-tested. |
+| **Secure by default** | JWT + bcrypt, mandatory CAPTCHA, rate limiting, API-key signal ingestion, RBAC. |
+
+## Table of contents
 - [Architecture](#architecture)
-- [Miscellaneous](#miscellaneous)
+- [Tech stack](#tech-stack)
+- [How it works](#how-it-works)
+- [Mapping signals to machines](#mapping-signals-to-machines)
+- [Repository layout](#repository-layout)
+- [Quick start](#quick-start-local-dev)
+- [Deployment](#deployment-docker-compose)
+- [Configuration](#configuration)
+- [Security](#security)
+- [Documentation](#documentation)
 
-## 1. Overview <a name="overview"></a>
-LineSentry is a real-time analytics platform for industrial machinery, designed to monitor OEE (Overall Equipment Effectiveness), MTTR (Mean Time To Repair), and MTBF (Mean Time Between Failures). It integrates with PLCs via Raspberry Pi to capture power/unit-cycle signals, replacing legacy SAP-based systems and proprietary solutions like ProManage. The platform offers live dashboards, automated alerts, and customizable reporting, empowering Dawlance with full control over machine analytics.
+## Architecture
 
-## 2. Problem Statement <a name="problem-statement"></a>
-- Legacy SAP systems provided only historical MTTR/MTBF data, lacking real-time insights.
-- Solutions like ProManage were inflexible (limited hardware/machine support), expensive (€200K), and vendor-dependent.
-- Paper-based layouts and manual data entry caused operational delays.
-- No unified view of factory-wide/department-level OEE, MTTR, or MTBF.
+```
+        Factory floor                              Server  (scales horizontally)
+   ┌────────────────────────┐
+   │  PLC 1 ┐                │    X-API-Key
+   │  PLC 2 ┼── one daemon ──┼──── per PLC ────▶ ┌──────────────────┐     ┌────────────┐
+   │  PLC N ┘   each (Rust)  │   POST /pin-data  │   Rust backend   │────▶│  MongoDB   │
+   └────────────────────────┘   { plcId, hex }   │      (Axum)      │     └────────────┘
+                                                  │  pipeline · OEE  │
+   ┌────────────┐   REST + Socket.IO              │  · state machine │
+   │  Browser   │◀──────── nginx ────────────────▶│                  │
+   │  (React)   │                                 └──────────────────┘
+   └────────────┘
+```
 
-## 3. Solution <a name="solution"></a>
-LineSentry leverages PLCs + Raspberry Pi to ingest real-time signals from generic machines. It processes data to compute:
-- **Production Metrics:** Units produced, defects, performance, availability, quality.
-- **Analytics:** Real-time OEE, MTTR, MTBF, downtime classification.
-- **Automation:** Breakdown emails to maintenance teams, shift/mold tracking.
+Each daemon reads its PLC's output bytes and POSTs them (hex + `plcId` + timestamp).
+The backend decodes the bytes into `Q{byte}.{bit}` pins, resolves each `(plcId, pin)`
+to a sensor (`power` or `unit-cycle`) and machine, then runs a 4-state machine —
+**running · stoppage · stopped_yet_producing · inactive** — persisting hourly
+production records and broadcasting live updates.
 
-**Advantages:**
-- ✅ Cost-effective (open hardware, no vendor lock-in).
-- ✅ Flexible (supports any machine via PLC signal mapping).
-- ✅ User-friendly (drag-and-drop layouts, intuitive UI).
+## Tech stack
 
-## 4. Key Features <a name="key-features"></a>
+| Layer | Technology |
+|-------|------------|
+| **Frontend** | React 18 · TypeScript · Vite · TailwindCSS (token-based design system) · TanStack Query · Socket.IO client · Recharts |
+| **Backend** | **Rust** — Axum · Tokio · `mongodb` · `socketioxide` · `jsonwebtoken` + `bcrypt` · `lettre` (email) · `printpdf` (reports) |
+| **Database** | MongoDB |
+| **Edge daemon** | **Rust** — Tokio + `reqwest`; Siemens S7 via `snap7-rs` (feature-gated) or a built-in simulator |
+| **Realtime / scale** | Socket.IO; Redis adapter-ready for horizontal scaling |
+| **Deploy** | Docker Compose (nginx · backend · MongoDB · Redis) |
 
-### Admin Capabilities
-- **User/Role Management:** CRUD operations for users, role assignment (Admin/Operator), least-privilege principle.
-- **Machine/Department Setup:**
-  - Map machines to departments with interactive drag-and-drop layouts.
-  - Configure PLCs (IP, rack, slot), signal types (power/unit-cycle), and pin mappings.
-- **Production Configuration:**
-  - Define molds with ideal cycle times (for performance calculation).
-  - Set shift timings, assign operators/molds per shift (batch/hourly).
-  - Configure email alerts (SMTP credentials, recipient lists).
-- **Thresholds & Reporting:**
-  - Customize OEE/MTTR/MTBF thresholds (Excellent/Good/Fair/Bad).
-  - Generate/download reports by department, machine, or timeframe.
+> The Rust backend has fully replaced the original Node/Express server (now removed).
+> The Python daemon (`python-daemon/`) is kept as a verified fallback until the Rust
+> daemon's Siemens-S7 path is confirmed on real hardware. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-### Operator Capabilities
-- Real-time machine status (Running/Inactive/Breakdown).
-- Log defects, classify stoppages, and link SAP notification IDs during breakdowns.
-- View live production timelines (operator/mold history, defects).
+## How it works
 
-### Dashboard & Analytics
-- **Factory Overview:**
-  - Cards: Departments, active machines, factory OEE, unclassified stoppages.
-- **Department View:**
-  - Machine layouts with OEE, units produced, and statuses.
-  - Add/remove machines dynamically.
-- **Machine Analytics:**
-  - Weekly/monthly/custom OEE, MTTR, MTBF trends.
-  - Production timeline: Live operator/mold/defect tracking with stoppage classification.
+1. **Ingestion** — each daemon POSTs its PLC's bytes to `/api/signals/pin-data`,
+   authenticated with a shared `X-API-Key`. Retries with exponential backoff;
+   idempotent (per PLC) against duplicates.
+2. **Pipeline** — the backend decodes the bytes, resolves each `(plcId, Q{byte}.{bit})`
+   to a sensor (cached), updates `SignalData` + hourly `ProductionRecord`s, runs the
+   state machine, and emits Socket.IO events — recomputing only the machines on the
+   posting PLC, so cost stays flat as the plant grows.
+3. **Analytics** — OEE = availability × quality × performance; MTBF/MTTR from
+   breakdown stoppages; aggregated per machine / department / factory over any
+   timeframe (bucketed in the factory's local timezone).
+4. **Operations** — operators classify stoppages (with SAP notification IDs) and log
+   defects; admins manage PLCs, departments, machines, signals, molds, shifts,
+   thresholds, and email reporting.
 
-### Reports
-- Customizable PDF/Excel reports emailed to stakeholders.
+## Mapping signals to machines
 
-## 5. System Architecture <a name="system-architecture"></a>
+A **signal** is a sensor (role `power` or `unit-cycle`) bound to a PLC pin. The
+**Setup** page makes a machine production-ready in three checks:
 
-### Design Patterns
-- Singleton: Database connection pooling.
-- MVC: Separation of concerns (Model-View-Controller).
-- Adapter: Unified interfaces for PLC signal ingestion.
-- Observer: Real-time notifications for CRUD operations.
-- Decorator: Secured API route middleware.
+```
+   Power signal wired   ->  availability + running time
+   Cycle signal wired   ->  units produced + quality
+   Mold defined         ->  ideal rate -> performance -> OEE
+```
 
-### Tech Stack
-| Layer | Technologies |
-|-------|-------------|
-| Frontend | React, TailwindCSS, Material UI, Lucide-react |
-| Backend | Node.js, Express.js, TypeScript |
-| Database | MongoDB (Repository pattern) |
-| PLC Integration | Python/Rust daemons (signal ingestion) |
+PLCs live in a **registry** (id · name · connection · byte count). Pins are addressed
+Siemens-style `Q{byte}.{bit}`, and every mapping is scoped to its `plcId` — so a
+4-byte PLC offers 32 pins (`Q0.0…Q3.7`), and `line-1 · Q0.0` is independent of
+`line-2 · Q0.0`. Run **one daemon per PLC** (`PLC_ID` + `BYTE_COUNT`), or a single
+entry with more bytes for a head/gateway PLC that aggregates others.
 
-### Data Flow
-- Diagram
-- Code
+## Repository layout
 
-## 6. Security <a name="security"></a>
-- **Authentication**: JWT-based access control with CAPTCHA protection against brute-force attacks.
-- **API Protection**: 
-  - Axios HTTP client with CSRF tokens and XSS prevention
-  - Rate limiting (5 login attempts per 15 minutes, 100 general requests per 15 minutes)
-  - Helmet.js for security headers
-  - Google reCAPTCHA v2 integration
-- Credentials: .env file (excluded from Git).
-- RBAC: Operators restricted to data entry; Admins own configurations.
-- **Request Security**: All API calls use axios with proper error handling and timeout configuration.
+```
+/                 React frontend (Vite)
+/backend          Rust backend (Axum + MongoDB + Socket.IO)        <- primary
+/daemon           Rust edge daemon (simulator + S7 PLC reader)     <- primary
+/python-daemon    Legacy Python daemon (fallback / S7 reference)
+/deploy           docker-compose.yml, Dockerfiles, nginx config
+/docs             ARCHITECTURE · SECURITY · DEPLOYMENT · openapi.yaml
+/.github          CI workflows
+```
 
-## 7. Future Improvements <a name="future-improvements"></a>
-- Biometric Security: Card/facial recognition for login.
-- Computer Vision: Automated defect detection.
-- Energy Monitoring: Track machine power consumption.
-- Layout Export: Download department machine layouts as PDF.
+## Quick start (local dev)
 
-## 8. Installation & Setup <a name="installation--setup"></a>
+**Prerequisites:** Node 20+, Rust 1.80+, MongoDB (local or Atlas).
 
-### Prerequisites
-- Node.js v18+, MongoDB Atlas, Python 3.10/Rust.
-- Raspberry Pi 4+ with PLC connectivity.
+```bash
+# 1 - Backend (Rust)
+cd backend
+cp .env.example .env          # set JWT_SECRET, DAEMON_API_KEY, MONGODB_URI
+cargo run                     # -> http://localhost:3001
 
-### Steps
-1. Clone the repo:
-   ```bash
-   git clone https://github.com/dawlance/linesentry.git
-   ```
-2. Backend:
-   ```bash
-   sudo systemctl start mongodb
-   cd server && npm install
-   cp .env.example .env  # Set DB/JWT configs
-   node index.js
-   ```
-3. Frontend:
-   ```bash
-   npm install
-   npm run dev
-   ```
-4. PLC Daemon:
-   ```bash
-   cd python-daemon
-   python signal_daemon.py
-   ```
-   or
-   ```bash
-   cd rust-daemon
-   cargo run
-   ```
-   
-## 9. Usage <a name="usage"></a>
+# 2 - Frontend (React), from the repo root
+cp .env.example .env          # set VITE_API_BASE_URL + VITE_SOCKET_URL
+npm install
+npm run dev                   # -> http://localhost:5173
 
-- **Admin Login:**
-  - Configure departments, machines, PLCs, and shifts.
-  - Set OEE/MTTR thresholds and email alerts.
+# 3 - Seed demo data + a simulated signal source
+curl -X POST http://localhost:3001/api/auth/init-demo     # admin/admin123 · operator/operator123
+cd daemon && BACKEND_URL=http://localhost:3001 DAEMON_API_KEY=<same> \
+             PLC_ID=default BYTE_COUNT=2 SOURCE=simulator cargo run
+```
 
-- **Operator Login:**
-  - View assigned machines; log defects/stoppages.
-  - Classify breakdowns with SAP notification IDs.
+Log in at **http://localhost:5173** with `admin` / `admin123`, then open **Setup**
+to register a PLC and wire your first machine's signals.
 
-- **Dashboard:**
-  - Monitor factory/department OEE at a glance.
-  - Click machines to analyze trends or update production logs.
+## Deployment (Docker Compose)
 
-## 10. Architecture <a name="architecture"></a>
+```bash
+cp deploy/.env.example deploy/.env        # set JWT_SECRET, DAEMON_API_KEY, etc.
+docker compose -f deploy/docker-compose.yml up -d --build
+```
 
-<img width="1922" height="836" alt="sunny-shaban-ali-line-sentry-arch" src="https://github.com/user-attachments/assets/f8e3f289-1dbb-48ab-9187-71b289f98042" />
+Brings up nginx (frontend) + the Rust backend + MongoDB + Redis. Each daemon runs on
+the Raspberry Pi next to its PLC (see [daemon/README.md](daemon/README.md)).
+Full guide: [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 
-## 11. Miscellaneous <a name="miscllaneous"></a>
+## Configuration
 
-![sunny-shaban-ali-line-sentry-testing-0](https://github.com/user-attachments/assets/4d09144d-5692-4c24-a618-ceb7a1859a01)
+Every service ships a documented `.env.example`. Key backend variables:
+`MONGODB_URI`, `JWT_SECRET`, `DAEMON_API_KEY`, `RECAPTCHA_SECRET_KEY`, `CORS_ORIGIN`,
+`REDIS_URL`, and `FACTORY_UTC_OFFSET_MINUTES` (bucket production in the factory's
+local time). The backend refuses to start if required secrets are missing.
 
-![sunny-shaban-ali-line-sentry-testing-1](https://github.com/user-attachments/assets/f2fa6f8a-6d13-4275-a9fe-bf9f5cb1ed6c)
+## Security
 
+JWT auth (bcrypt-hashed passwords), mandatory reCAPTCHA on login, per-IP rate
+limiting, an `X-API-Key` gate on signal ingestion, input validation, security
+headers, and CORS locked to configured origins. Threat model and details:
+[docs/SECURITY.md](docs/SECURITY.md).
+
+## Documentation
+
+| Doc | What's inside |
+|-----|---------------|
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Components, data flow, the signal pipeline |
+| [docs/SECURITY.md](docs/SECURITY.md) | Auth, RBAC, hardening, threat model |
+| [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | Docker, scaling, ops runbook |
+| [docs/openapi.yaml](docs/openapi.yaml) | REST API reference |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | Dev setup, conventions, tests |
+
+<div align="center"><sub>Built with 🦀 Rust and ⚛️ React · MIT licensed</sub></div>

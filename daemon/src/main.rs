@@ -31,8 +31,13 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let mut src = Source::from_config(&cfg)?;
-    let client = reqwest::Client::builder().timeout(cfg.request_timeout).build()?;
-    let url = format!("{}/api/signals/pin-data", cfg.backend_url.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .timeout(cfg.request_timeout)
+        .build()?;
+    let url = format!(
+        "{}/api/signals/pin-data",
+        cfg.backend_url.trim_end_matches('/')
+    );
 
     let mut failures: u32 = 0;
     let mut ticker = tokio::time::interval(cfg.interval);
@@ -45,19 +50,21 @@ async fn main() -> anyhow::Result<()> {
                 break;
             }
             _ = ticker.tick() => {
-                let byte = match src.read_byte() {
+                let bytes = match src.read(cfg.byte_count) {
                     Ok(b) => b,
                     Err(e) => { tracing::error!("signal read error: {e:#}"); continue; }
                 };
+                let pin_data: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
                 let payload = json!({
-                    "pinData": format!("{byte:02x}"),
+                    "plcId": cfg.plc_id,
+                    "pinData": pin_data,
                     "timestamp": chrono::Utc::now().to_rfc3339(),
                 });
                 match send(&client, &url, &cfg.api_key, &payload).await {
                     Ok(processed) => {
                         failures = 0;
                         if processed.is_empty() {
-                            tracing::debug!("sent pin data {byte:08b}");
+                            tracing::debug!("sent pin data {pin_data}");
                         } else {
                             tracing::info!("processed machines: {processed:?}");
                         }
@@ -98,7 +105,11 @@ async fn send(
     Ok(body
         .get("processedMachines")
         .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default())
 }
 
@@ -122,7 +133,8 @@ async fn shutdown_signal() {
     };
     #[cfg(unix)]
     let terminate = async {
-        if let Ok(mut s) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        if let Ok(mut s) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
             s.recv().await;
         }
     };

@@ -1,891 +1,324 @@
-import React, { useEffect, useState, useContext } from 'react';
+import React, { useEffect, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { toast } from 'react-toastify';
+import { format, startOfYear, startOfMonth, startOfWeek, startOfDay } from 'date-fns';
+import { ArrowLeft, Activity, AlertTriangle, Clock, Gauge, Zap, ZapOff, Edit, Info, Calendar, Check } from 'lucide-react';
 import { Machine, MachineStats, MachineStatus } from '../types';
 import apiService from '../services/api';
 import socketService from '../services/socket';
+import { useSocketEvent } from '../hooks/useSocketEvent';
 import ProductionTimeline from './ProductionTimeline';
-import { ToastContainer, toast } from 'react-toastify';
-import { format, startOfYear, startOfMonth, startOfWeek, startOfDay } from 'date-fns';
-import 'react-toastify/dist/ReactToastify.css';
-import {
-  ArrowLeft,
-  Activity,
-  AlertTriangle,
-  Clock,
-  Gauge,
-  Zap,
-  ZapOff,
-  Edit,
-  Info,
-  Calendar,
-  Check,
-} from 'lucide-react';
-import { ThemeContext } from '../App';
+import { Button, Input, Label, Card, CardContent, PageLoader, Spinner } from './ui';
+import { cn } from '../lib/cn';
+
+type Period = 'today' | 'week' | 'month' | 'year' | 'custom';
+const PERIODS: { value: Period; label: string }[] = [
+  { value: 'today', label: 'Today' },
+  { value: 'week', label: 'This Week' },
+  { value: 'month', label: 'Month to Date' },
+  { value: 'year', label: 'Year to Date' },
+  { value: 'custom', label: 'Custom Range' },
+];
+const fmt = (d: Date) => format(d, 'yyyy-MM-dd');
+const errMsg = (e: unknown, fallback: string) => (e instanceof Error ? e.message : fallback);
+
+const statusStyle = (s?: string) =>
+  s === 'running' ? 'text-success bg-success/10 border-success/20'
+    : s === 'stoppage' ? 'text-destructive bg-destructive/10 border-destructive/20 animate-pulse'
+    : s === 'stopped_yet_producing' ? 'text-warning bg-warning/10 border-warning/20'
+    : 'text-muted-foreground bg-muted border-border';
+const statusIcon = (s?: string) =>
+  s === 'running' ? <Zap className="h-4 w-4" /> : s === 'stoppage' ? <AlertTriangle className="h-4 w-4" /> : s === 'stopped_yet_producing' ? <ZapOff className="h-4 w-4" /> : <Activity className="h-4 w-4" />;
+
+const MetricBar: React.FC<{ label: string; value: number; barClass: string; title: string }> = ({ label, value, barClass, title }) => (
+  <div className="flex items-center justify-between" title={title}>
+    <span className="flex items-center gap-1 text-muted-foreground">{label}<Info className="h-3 w-3" /></span>
+    <div className="flex items-center gap-2">
+      <div className="h-2 w-20 rounded-full bg-muted"><div className={cn('h-2 rounded-full', barClass)} style={{ width: `${value}%` }} /></div>
+      <span className="font-medium text-foreground">{value}%</span>
+    </div>
+  </div>
+);
 
 const MachineView: React.FC = () => {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
-  const { isDarkMode } = useContext(ThemeContext);
-  const [machine, setMachine] = useState<Machine | null>(null);
-  const [stats, setStats] = useState<MachineStats | null>(null);
-  const [ytdStats, setYtdStats] = useState<MachineStats | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [selectedPeriod, setSelectedPeriod] = useState<'today' | 'week' | 'month' | 'year' | 'custom'>('today');
-  const [customStartDate, setCustomStartDate] = useState<string>('');
-  const [customEndDate, setCustomEndDate] = useState<string>('');
+  const queryClient = useQueryClient();
+
+  const [selectedPeriod, setSelectedPeriod] = useState<Period>('today');
+  const [customStartDate, setCustomStartDate] = useState('');
+  const [customEndDate, setCustomEndDate] = useState('');
   const [appliedCustomDates, setAppliedCustomDates] = useState({ start: '', end: '' });
   const [machineStatus, setMachineStatus] = useState<string>('inactive');
   const [isEditing, setIsEditing] = useState(false);
-  const [editForm, setEditForm] = useState({
-    name: '',
-    description: ''
-  });
-  const [tooltip, setTooltip] = useState<{
-    content: string;
-    x: number;
-    y: number;
-    visible: boolean;
-  } | null>(null);
+  const [editForm, setEditForm] = useState({ name: '', description: '' });
 
-  // Theme classes
-  const bgClass = isDarkMode ? 'bg-gray-900' : 'bg-gray-50';
-  const cardBgClass = isDarkMode ? 'bg-gray-800' : 'bg-white';
-  const cardBorderClass = isDarkMode ? 'border-gray-700' : 'border-gray-200';
-  const textClass = isDarkMode ? 'text-white' : 'text-gray-900';
-  const textSecondaryClass = isDarkMode ? 'text-gray-400' : 'text-gray-600';
-  const inputBgClass = isDarkMode ? 'bg-gray-700' : 'bg-white';
-  const inputBorderClass = isDarkMode ? 'border-gray-600' : 'border-gray-300';
-  const buttonPrimaryClass = isDarkMode 
-    ? 'bg-blue-600 hover:bg-blue-700' 
-    : 'bg-blue-600 hover:bg-blue-500';
-  const buttonSecondaryClass = isDarkMode 
-    ? 'border-gray-600 text-gray-300 hover:bg-gray-700' 
-    : 'border-gray-300 text-gray-700 hover:bg-gray-100';
-
-  // Handle mouse events for tooltip
-  const handleMouseEnter = (content: string) => (e: React.MouseEvent) => {
-    setTooltip({
-      content,
-      x: e.clientX,
-      y: e.clientY,
-      visible: true
-    });
-  };
-
-  const handleMouseLeave = () => {
-    setTooltip(null);
-  };
-
-  const handleMouseMove = (e: React.MouseEvent) => {
-    if (tooltip) {
-      setTooltip({
-        ...tooltip,
-        x: e.clientX,
-        y: e.clientY
-      });
-    }
-  };
-
-  // Helper function to format date
-  const formatUTCDate = (date: Date) => {
-    return format(date, 'yyyy-MM-dd');
-  };
-
-  // Adjust getDateRange to use UTC-based calculations
-  const getDateRange = () => {
+  const range = (): { startDate: string; endDate: string } => {
     const now = new Date();
-    
     switch (selectedPeriod) {
-      case 'today':
-        return {
-          startDate: formatUTCDate(startOfDay(now)),
-          endDate: formatUTCDate(now)
-        };
-      case 'week':
-        return {
-          startDate: formatUTCDate(startOfWeek(now)),
-          endDate: formatUTCDate(now)
-        };
-      case 'month':
-        return {
-          startDate: formatUTCDate(startOfMonth(now)),
-          endDate: formatUTCDate(now)
-        };
-      case 'year':
-        return {
-          startDate: formatUTCDate(startOfYear(now)),
-          endDate: formatUTCDate(now)
-        };
-      case 'custom':
-        return {
-          startDate: appliedCustomDates.start || customStartDate,
-          endDate: appliedCustomDates.end || customEndDate
-        };
-      default:
-        return {
-          startDate: formatUTCDate(startOfDay(now)),
-          endDate: formatUTCDate(now)
-        };
+      case 'week': return { startDate: fmt(startOfWeek(now)), endDate: fmt(now) };
+      case 'month': return { startDate: fmt(startOfMonth(now)), endDate: fmt(now) };
+      case 'year': return { startDate: fmt(startOfYear(now)), endDate: fmt(now) };
+      case 'custom': return { startDate: appliedCustomDates.start || customStartDate, endDate: appliedCustomDates.end || customEndDate };
+      default: return { startDate: fmt(startOfDay(now)), endDate: fmt(now) };
     }
   };
+  const ytdRange = () => { const now = new Date(); return { startDate: fmt(startOfYear(now)), endDate: fmt(now) }; };
 
+  const machineQ = useQuery<Machine>({ queryKey: ['machine', id], queryFn: () => apiService.getMachine(id!), enabled: !!id });
+  const statsQ = useQuery<MachineStats>({
+    queryKey: ['machine-stats', id, selectedPeriod, appliedCustomDates.start, appliedCustomDates.end],
+    queryFn: () => apiService.getMachineStats(id!, range()),
+    enabled: !!id && (selectedPeriod !== 'custom' || (!!appliedCustomDates.start && !!appliedCustomDates.end)),
+  });
+  const ytdQ = useQuery<MachineStats>({ queryKey: ['machine-stats-ytd', id], queryFn: () => apiService.getMachineStats(id!, ytdRange()), enabled: !!id });
 
-  const handleApplyCustomDates = () => {
-    if (!customStartDate || !customEndDate) {
-      toast.error('Please select both start and end dates');
-      return;
-    }
-    
-    if (customStartDate > customEndDate) {
-      toast.error('Start date must be before end date');
-      return;
-    }
-    
-    setAppliedCustomDates({ start: customStartDate, end: customEndDate });
-  };
+  const machine = machineQ.data ?? null;
+  const stats = statsQ.data ?? null;
+  const ytdStats = ytdQ.data ?? null;
 
-  // Check if custom dates have changed but not applied
-  const hasUnappliedChanges = selectedPeriod === 'custom' && 
-    (customStartDate !== appliedCustomDates.start || customEndDate !== appliedCustomDates.end) &&
-    customStartDate && customEndDate;
-
+  // Seed edit form + live status from the fetched machine
   useEffect(() => {
-    if (id) {
-      fetchMachineData();
-      setupSocketListeners();
+    if (machineQ.data) {
+      setEditForm({ name: machineQ.data.name, description: machineQ.data.description || '' });
+      setMachineStatus((prev) => (prev === 'inactive' ? machineQ.data!.status : prev));
     }
-    return () => {
-      if (id) {
-        socketService.leaveMachine(id);
-      }
-    };
-  }, [id, selectedPeriod, appliedCustomDates]);
+  }, [machineQ.data]);
 
-   const fetchYtdStats = async () => {
-    try {
-      const now = new Date();
-      const ytdStart = formatUTCDate(startOfYear(now));
-      const response = await apiService.request(`/analytics/machine-stats/${id}`, {
-        method: 'GET',
-        params: {
-          startDate: ytdStart,
-          endDate: formatUTCDate(now)
-        }
-      });
-      setYtdStats(response);
-    } catch (err) {
-      console.error('Failed to fetch YTD stats:', err);
-    }
-  };
-
-  // Fetch year-to-date stats on component mount
+  // Join the machine's realtime room
   useEffect(() => {
     if (!id) return;
-    fetchYtdStats();
-  }, [id]);
-
-  const setupSocketListeners = () => {
-    if (!id) return;
-
     socketService.connect();
     socketService.joinMachine(id);
+    return () => socketService.leaveMachine(id);
+  }, [id]);
 
-    const handleProductionUpdate = (update: any) => {
-      if (update.machineId === id) {
-        fetchStats();
-        fetchYtdStats();
-      }
-    };
-
-    const handleAssignmentUpdated = (update: any) => {
-      if (update.machineId === id) {
-        fetchStats();
-        fetchYtdStats();
-      }
-    };
-
-    const handleStoppageUpdated = (update: any) => {
-      if (update.machineId === id) {
-        fetchStats();
-        fetchYtdStats();
-      }
-    };
-
-    const handleStoppageDetected = (stoppage: any) => {
-      if (stoppage.machineId === id) {
-        toast.warning(`Stoppage detected: ${stoppage.duration} minutes`, {
-          position: "top-right",
-          autoClose: 5000,
-          theme: isDarkMode ? "dark" : "light"
-        });
-        fetchMachineData();
-        fetchYtdStats();
-      }
-    };
-
-    const handleMachineStateUpdate = (update: any) => {
-      if (update.machineId === id) {
-        setMachineStatus(update.status);
-        setMachine(prev => prev ? { ...prev, status: update.dbStatus } : null);
-      }
-    };
-
-    socketService.on('production-update', handleProductionUpdate);
-    socketService.on('stoppage-detected', handleStoppageDetected);
-    socketService.on('production-assignment-updated', handleAssignmentUpdated);
-    socketService.on('stoppage-updated', handleStoppageUpdated);
-    socketService.on('stoppage-added', handleStoppageDetected);
-    socketService.on('machine-state-update', handleMachineStateUpdate);
-
-    return () => {
-      socketService.off('production-update', handleProductionUpdate);
-      socketService.off('stoppage-detected', handleStoppageDetected);
-      socketService.off('stoppage-added', handleStoppageDetected);
-      socketService.off('machine-state-update', handleMachineStateUpdate);
-      socketService.off('production-assignment-updated', handleAssignmentUpdated);
-      socketService.off('stoppage-updated', handleStoppageUpdated);
-    };
+  const refresh = () => {
+    queryClient.invalidateQueries({ queryKey: ['machine-stats', id] });
+    queryClient.invalidateQueries({ queryKey: ['machine-stats-ytd', id] });
   };
+  const forMachine = (cb: () => void) => (u: { machineId: string }) => { if (u.machineId === id) cb(); };
 
-  const fetchMachineData = async () => {
-    try {
-      setLoading(true);
-      const machineData = await apiService.getMachine(id!);
-      
-      setMachine(machineData);
-      setEditForm({
-        name: machineData.name,
-        description: machineData.description || ''
-      });
+  useSocketEvent('production-update', forMachine(refresh));
+  useSocketEvent('production-assignment-updated', forMachine(refresh));
+  useSocketEvent('stoppage-updated', forMachine(refresh));
+  useSocketEvent('stoppage-added', forMachine(() => { refresh(); queryClient.invalidateQueries({ queryKey: ['machine', id] }); }));
+  useSocketEvent('machine-state-update', (u) => {
+    if (u.machineId !== id) return;
+    setMachineStatus(u.status);
+    queryClient.setQueryData<Machine>(['machine', id], (m) => (m ? { ...m, status: u.dbStatus as MachineStatus } : m));
+  });
 
-      
-      // Fetch stats for selected period
-      const { startDate, endDate } = getDateRange();
-      const [statsData] = await Promise.all([
-        apiService.request(`/analytics/machine-stats/${id}`, {
-          method: 'GET',
-          params: { startDate, endDate }
-        })
-      ]);
-      
-      setStats(statsData);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : 'Failed to fetch machine data';
-      toast.error(message);
-    } finally {
-      setLoading(false);
-    }
+  const handleApplyCustomDates = () => {
+    if (!customStartDate || !customEndDate) return toast.error('Please select both start and end dates');
+    if (customStartDate > customEndDate) return toast.error('Start date must be before end date');
+    setAppliedCustomDates({ start: customStartDate, end: customEndDate });
   };
-
-  const fetchStats = async () => {
-    try {
-      const { startDate, endDate } = getDateRange();
-      const statsData = await apiService.request(`/analytics/machine-stats/${id}`, {
-        method: 'GET',
-        params: {
-          startDate,
-          endDate
-        }
-      });
-      setStats(statsData);
-    } catch (err) {
-      console.error('Failed to fetch stats:', err);
-    }
-  };
-
-  const handleAddStoppage = async (stoppage: any) => {
-    try {
-      await apiService.addStoppageRecord({
-        ...stoppage,
-        machineId: id
-      });
-      toast.success('Stoppage recorded successfully');
-      fetchMachineData();
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Failed to record stoppage');
-    }
-  };
-
-  const handleUpdateProduction = async (machineId: string, hour: number, date: string, data: any) => {
-    try {
-      await apiService.updateProductionAssignment({
-        machineId,
-        hour,
-        date,
-        ...data
-      });
-      toast.success('Production data updated');
-      fetchStats();
-      fetchMachineData();
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Failed to update production data');
-    }
-  };
-
-  const handleEditChange = (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => {
-    const { name, value } = e.target;
-    setEditForm(prev => ({ ...prev, [name]: value }));
-  };
+  const hasUnappliedChanges = selectedPeriod === 'custom'
+    && (customStartDate !== appliedCustomDates.start || customEndDate !== appliedCustomDates.end)
+    && !!customStartDate && !!customEndDate;
 
   const handleSaveEdit = async () => {
     if (!machine || !id) return;
-    
     try {
-      const updatedMachine = await apiService.updateMachine(id, editForm);
-      setMachine(updatedMachine);
+      await apiService.updateMachine(id, editForm);
+      queryClient.invalidateQueries({ queryKey: ['machine', id] });
       setIsEditing(false);
       toast.success('Machine details updated');
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Failed to update machine');
+      toast.error(errMsg(err, 'Failed to update machine'));
     }
   };
 
-  const getStatusColor = (status: MachineStatus) => {
-    switch (status) {
-      case 'running': return 'text-green-400 bg-green-400/10 border-green-400/20';
-      case 'stoppage': return 'text-red-400 bg-red-400/10 border-red-400/20 animate-pulse';
-      case 'stopped_yet_producing': return 'text-orange-400 bg-orange-400/10 border-orange-400/20';
-      case 'inactive': return 'text-gray-400 bg-gray-400/10 border-gray-400/20';
-      default: return 'text-gray-400 bg-gray-400/10 border-gray-400/20';
+  const handleAddStoppage = async (stoppage: Record<string, unknown>) => {
+    try {
+      await apiService.addStoppageRecord({ ...stoppage, machineId: id });
+      toast.success('Stoppage recorded successfully');
+      refresh();
+    } catch (err) {
+      toast.error(errMsg(err, 'Failed to record stoppage'));
+    }
+  };
+  const handleUpdateProduction = async (machineId: string, hour: number, date: string, data: Record<string, unknown>) => {
+    try {
+      await apiService.updateProductionAssignment({ machineId, hour, date, ...data });
+      toast.success('Production data updated');
+      refresh();
+    } catch (err) {
+      toast.error(errMsg(err, 'Failed to update production data'));
     }
   };
 
-  const getStatusIcon = (status: MachineStatus) => {
-    switch (status) {
-      case 'running': return <Zap className="h-4 w-4" />;
-      case 'stoppage': return <AlertTriangle className="h-4 w-4" />;
-      case 'stopped_yet_producing': return <ZapOff className="h-4 w-4" />;
-      case 'inactive': return <Activity className="h-4 w-4" />;
-      default: return <Activity className="h-4 w-4" />;
-    }
-  };
+  if (machineQ.isLoading) return <PageLoader label="Loading machine…" />;
+  if (!machine) return <div className="py-12 text-center text-muted-foreground">Machine not found</div>;
 
-  if (loading) {
-    return (
-      <div className={`flex items-center justify-center h-64 ${bgClass}`}>
-        <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-500"></div>
-      </div>
-    );
-  }
-
-  if (!machine || !stats || !ytdStats) {
-    return (
-      <div className={`text-center py-12 ${bgClass}`}>
-        <p className={textSecondaryClass}>Machine not found</p>
-      </div>
-    );
-  }
-
-  // Convert MTBF to days for YTD display
-  const mtbfDays = ytdStats.mtbf > 0 ? (ytdStats.mtbf / 1440).toFixed(1) : 0;
+  const displayStatus = machineStatus || machine.status;
+  const needDates = selectedPeriod === 'custom' && (!appliedCustomDates.start || !appliedCustomDates.end);
+  const mtbfDays = ytdStats && ytdStats.mtbf > 0 ? (ytdStats.mtbf / 1440).toFixed(1) : 0;
+  const defectRate = stats && stats.totalUnitsProduced > 0 ? ((stats.totalDefectiveUnits / stats.totalUnitsProduced) * 100).toFixed(1) : 0;
 
   return (
-    <div className={`space-y-6 min-h-screen p-4 ${bgClass}`}>
-      <ToastContainer
-        position="top-right"
-        autoClose={5000}
-        hideProgressBar={false}
-        newestOnTop={false}
-        closeOnClick
-        rtl={false}
-        pauseOnFocusLoss
-        draggable
-        pauseOnHover
-        theme={isDarkMode ? "dark" : "light"}
-      />
-      
-      {/* Custom Tooltip */}
-      {tooltip && (
-        <div 
-          className={`fixed text-sm px-3 py-2 rounded-md shadow-lg z-50 border transition-opacity ${
-            tooltip.visible ? 'opacity-100' : 'opacity-0 pointer-events-none'
-          } ${isDarkMode ? 'bg-gray-800 text-white border-gray-700' : 'bg-white text-gray-900 border-gray-200'}`}
-          style={{
-            left: tooltip.x + 10,
-            top: tooltip.y + 10,
-            transform: 'translate(0, -50%)',
-            maxWidth: '300px'
-          }}
-        >
-          {tooltip.content}
-        </div>
-      )}
-      
+    <div className="space-y-6">
       {/* Header */}
-      <div className="flex items-center justify-between">
-        <div className="flex items-center space-x-4">
-          <button
-            onClick={() => navigate(-1)}
-            className={`p-2 ${textSecondaryClass} hover:${textClass} hover:${isDarkMode ? 'bg-gray-700' : 'bg-gray-200'} rounded-md transition-colors`}
-          >
-            <ArrowLeft className="h-5 w-5" />
-          </button>
+      <div className="flex items-center justify-between gap-4">
+        <div className="flex flex-1 items-center gap-4">
+          <Button variant="ghost" size="icon" aria-label="Back" onClick={() => navigate(-1)}><ArrowLeft className="h-5 w-5" /></Button>
           {isEditing ? (
-            <div className="space-y-2 flex-1">
-              <input
-                name="name"
-                value={editForm.name}
-                onChange={handleEditChange}
-                className={`text-2xl font-bold ${textClass} ${inputBgClass} border ${inputBorderClass} rounded px-2 py-1 w-full`}
-              />
-              <textarea
-                name="description"
-                value={editForm.description}
-                onChange={handleEditChange}
-                className={`${textSecondaryClass} ${inputBgClass} border ${inputBorderClass} rounded px-2 py-1 w-full text-sm`}
-                rows={2}
-              />
+            <div className="flex-1 space-y-2">
+              <Input value={editForm.name} onChange={(e) => setEditForm({ ...editForm, name: e.target.value })} className="text-lg font-bold" />
+              <Input value={editForm.description} onChange={(e) => setEditForm({ ...editForm, description: e.target.value })} placeholder="Description" />
             </div>
           ) : (
             <div>
-              <h1 className={`text-2xl font-bold ${textClass}`}>{machine.name}</h1>
-              <p className={textSecondaryClass}>{machine.description}</p>
+              <h1 className="text-2xl font-bold text-foreground">{machine.name}</h1>
+              <p className="text-muted-foreground">{machine.description}</p>
             </div>
           )}
         </div>
-        
-        <div className="flex items-center space-x-3">
-          <div className={`flex items-center space-x-2 px-3 py-2 rounded-md border ${getStatusColor(machineStatus as MachineStatus || machine.status)}`}>
-            {getStatusIcon(machineStatus as MachineStatus || machine.status)}
-            <span className="font-medium capitalize">{(machineStatus || machine.status).replace('_', ' ')}</span>
+        <div className="flex items-center gap-3">
+          <div className={cn('flex items-center gap-2 rounded-md border px-3 py-2', statusStyle(displayStatus))}>
+            {statusIcon(displayStatus)}
+            <span className="font-medium capitalize">{displayStatus.replace(/_/g, ' ')}</span>
           </div>
-          
           {isEditing ? (
-            <div className="flex space-x-2">
-              <button
-                onClick={() => setIsEditing(false)}
-                className={`px-3 py-2 ${buttonSecondaryClass} rounded-md`}
-              >
-                Cancel
-              </button>
-              <button
-                onClick={handleSaveEdit}
-                className={`px-3 py-2 ${buttonPrimaryClass} text-white rounded-md`}
-              >
-                Save
-              </button>
+            <div className="flex gap-2">
+              <Button variant="outline" onClick={() => setIsEditing(false)}>Cancel</Button>
+              <Button onClick={handleSaveEdit}>Save</Button>
             </div>
           ) : (
-            <button
-              onClick={() => setIsEditing(true)}
-              className={`p-2 ${textSecondaryClass} hover:${textClass} hover:${isDarkMode ? 'bg-gray-700' : 'bg-gray-200'} rounded-md transition-colors`}
-              title="Edit machine details"
-            >
-              <Edit className="h-5 w-5" />
-            </button>
+            <Button variant="ghost" size="icon" aria-label="Edit machine" onClick={() => setIsEditing(true)}><Edit className="h-5 w-5" /></Button>
           )}
         </div>
       </div>
 
-      {/* Key Metrics - Year to Date */}
-      <div className="grid grid-cols-3 gap-2">
-        <div 
-          className={`p-3 rounded-lg border flex items-center relative ${cardBgClass} ${cardBorderClass}`}
-          onMouseEnter={handleMouseEnter('Overall Equipment Effectiveness (Year to Date)')}
-          onMouseLeave={handleMouseLeave}
-          onMouseMove={handleMouseMove}
-        >
-          <Gauge className={`h-6 w-6 mr-3 ${isDarkMode ? 'text-yellow-400' : 'text-amber-500'}`} />
-          <div>
-            <p className={`text-xs flex items-center ${textSecondaryClass}`}>
-              OEE (YTD)
-              <Info className="h-3 w-3 ml-1" />
-            </p>
-            <p className={`text-lg font-semibold ${isDarkMode ? 'text-yellow-400' : 'text-amber-600'}`}>
-              {ytdStats.oee}%
-            </p>
-          </div>
-        </div>
-
-        <div 
-          className={`p-3 rounded-lg border flex items-center relative ${cardBgClass} ${cardBorderClass}`}
-          onMouseEnter={handleMouseEnter('Mean Time Between Failures in days (Year to Date)')}
-          onMouseLeave={handleMouseLeave}
-          onMouseMove={handleMouseMove}
-        >
-          <Clock className={`h-6 w-6 mr-3 ${isDarkMode ? 'text-blue-400' : 'text-blue-500'}`} />
-          <div>
-            <p className={`text-xs flex items-center ${textSecondaryClass}`}>
-              MTBF (YTD)
-              <Info className="h-3 w-3 ml-1" />
-            </p>
-            <p className={`text-lg font-semibold ${isDarkMode ? 'text-blue-400' : 'text-blue-600'}`}>
-              {mtbfDays} days
-            </p>
-          </div>
-        </div>
-
-        <div 
-          className={`p-3 rounded-lg border flex items-center relative ${cardBgClass} ${cardBorderClass}`}
-          onMouseEnter={handleMouseEnter('Mean Time To Repair in minutes (Year to Date)')}
-          onMouseLeave={handleMouseLeave}
-          onMouseMove={handleMouseMove}
-        >
-          <Activity className={`h-6 w-6 mr-3 ${isDarkMode ? 'text-purple-400' : 'text-purple-500'}`} />
-          <div>
-            <p className={`text-xs flex items-center ${textSecondaryClass}`}>
-              MTTR (YTD)
-              <Info className="h-3 w-3 ml-1" />
-            </p>
-            <p className={`text-lg font-semibold ${isDarkMode ? 'text-purple-400' : 'text-purple-600'}`}>
-              {ytdStats.mttr} min
-            </p>
-          </div>
-        </div>
+      {/* YTD key metrics */}
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+        <Card><CardContent className="flex items-center gap-3 p-4" title="Overall Equipment Effectiveness (Year to Date)">
+          <Gauge className="h-6 w-6 text-warning" />
+          <div><p className="flex items-center gap-1 text-xs text-muted-foreground">OEE (YTD)<Info className="h-3 w-3" /></p><p className="text-lg font-semibold text-warning">{ytdStats?.oee ?? '—'}%</p></div>
+        </CardContent></Card>
+        <Card><CardContent className="flex items-center gap-3 p-4" title="Mean Time Between Failures in days (Year to Date)">
+          <Clock className="h-6 w-6 text-info" />
+          <div><p className="flex items-center gap-1 text-xs text-muted-foreground">MTBF (YTD)<Info className="h-3 w-3" /></p><p className="text-lg font-semibold text-info">{mtbfDays} days</p></div>
+        </CardContent></Card>
+        <Card><CardContent className="flex items-center gap-3 p-4" title="Mean Time To Repair in minutes (Year to Date)">
+          <Activity className="h-6 w-6 text-primary" />
+          <div><p className="flex items-center gap-1 text-xs text-muted-foreground">MTTR (YTD)<Info className="h-3 w-3" /></p><p className="text-lg font-semibold text-primary">{ytdStats?.mttr ?? '—'} min</p></div>
+        </CardContent></Card>
       </div>
 
-      {/* Time Period Selector */}
+      {/* Period selector */}
       <div className="space-y-4">
-        <div className="flex flex-col md:flex-row md:items-center space-y-2 md:space-y-0 md:space-x-4">
-          <span className={`text-sm font-medium ${textSecondaryClass}`}>View Analytics For:</span>
+        <div className="flex flex-col gap-2 md:flex-row md:items-center md:gap-4">
+          <span className="text-sm font-medium text-muted-foreground">View Analytics For:</span>
           <div className="flex flex-wrap gap-2">
-            {[
-              { value: 'today', label: 'Today' },
-              { value: 'week', label: 'This Week' },
-              { value: 'month', label: 'Month to Date' },
-              { value: 'year', label: 'Year to Date' },
-              { value: 'custom', label: 'Custom Range' }
-            ].map((period) => (
-              <button
-                key={period.value}
-                onClick={() => setSelectedPeriod(period.value as any)}
-                className={`px-4 py-2 text-sm rounded-lg transition-all duration-200 flex items-center font-medium ${
-                  selectedPeriod === period.value
-                    ? 'bg-blue-600 text-white shadow-md transform scale-105'
-                    : `${buttonSecondaryClass} hover:shadow-sm`
-                }`}
-              >
-                {period.value === 'custom' && <Calendar className="h-4 w-4 mr-2" />}
-                {period.label}
-              </button>
+            {PERIODS.map((p) => (
+              <Button key={p.value} size="sm" variant={selectedPeriod === p.value ? 'primary' : 'outline'} onClick={() => setSelectedPeriod(p.value)}>
+                {p.value === 'custom' && <Calendar className="h-4 w-4" />} {p.label}
+              </Button>
             ))}
           </div>
         </div>
-        
-        {/* Enhanced Custom Date Picker */}
+
         {selectedPeriod === 'custom' && (
-          <div className={`rounded-xl p-6 border-2 border-dashed transition-all duration-300 ${
-            isDarkMode 
-              ? 'bg-gray-800/50 border-gray-600 hover:border-gray-500 hover:bg-gray-800/70' 
-              : 'bg-blue-50/50 border-blue-200 hover:border-blue-300 hover:bg-blue-50/70'
-          }`}>
-            <div className="flex items-center space-x-3 mb-4">
-              <Calendar className={`h-5 w-5 ${isDarkMode ? 'text-blue-400' : 'text-blue-600'}`} />
-              <h3 className={`text-lg font-semibold ${textClass}`}>Custom Date Range</h3>
-            </div>
-            
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4 items-end">
-              {/* Start Date */}
-              <div className="space-y-2">
-                <label className={`text-sm font-medium ${textSecondaryClass} block`}>
-                  Start Date
-                </label>
-                <div className="relative">
-                  <input
-                    type="date"
-                    value={customStartDate}
-                    onChange={(e) => setCustomStartDate(e.target.value)}
-                    className={`w-full px-4 py-3 rounded-lg border-2 transition-all duration-200 focus:ring-2 focus:ring-blue-500 focus:border-blue-500 ${
-                      isDarkMode
-                        ? 'bg-gray-700 border-gray-600 text-white focus:bg-gray-600'
-                        : 'bg-white border-gray-300 text-gray-900 focus:bg-gray-50'
-                    }`}
-                  />
-                </div>
+          <Card className="border-dashed">
+            <CardContent className="space-y-4 p-6">
+              <div className="flex items-center gap-3"><Calendar className="h-5 w-5 text-primary" /><h3 className="text-lg font-semibold text-foreground">Custom Date Range</h3></div>
+              <div className="grid grid-cols-1 items-end gap-4 md:grid-cols-3">
+                <div><Label>Start date</Label><Input type="date" value={customStartDate} onChange={(e) => setCustomStartDate(e.target.value)} /></div>
+                <div><Label>End date</Label><Input type="date" value={customEndDate} onChange={(e) => setCustomEndDate(e.target.value)} /></div>
+                <Button onClick={handleApplyCustomDates} disabled={!customStartDate || !customEndDate} className={cn(hasUnappliedChanges && 'animate-pulse')}>
+                  <Check className="h-4 w-4" /> {hasUnappliedChanges ? 'Apply Changes' : 'Applied'}
+                </Button>
               </div>
-              
-              {/* End Date */}
-              <div className="space-y-2">
-                <label className={`text-sm font-medium ${textSecondaryClass} block`}>
-                  End Date
-                </label>
-                <div className="relative">
-                  <input
-                    type="date"
-                    value={customEndDate}
-                    onChange={(e) => setCustomEndDate(e.target.value)}
-                    className={`w-full px-4 py-3 rounded-lg border-2 transition-all duration-200 focus:ring-2 focus:ring-blue-500 focus:border-blue-500 ${
-                      isDarkMode
-                        ? 'bg-gray-700 border-gray-600 text-white focus:bg-gray-600'
-                        : 'bg-white border-gray-300 text-gray-900 focus:bg-gray-50'
-                    }`}
-                  />
-                </div>
-              </div>
-              
-              {/* Apply Button */}
-              <div className="space-y-2">
-                <label className="text-sm font-medium text-transparent block">Apply</label>
-                <button
-                  onClick={handleApplyCustomDates}
-                  disabled={!customStartDate || !customEndDate}
-                  className={`w-full px-6 py-3 rounded-lg font-medium transition-all duration-200 flex items-center justify-center space-x-2 ${
-                    hasUnappliedChanges
-                      ? 'bg-gradient-to-r from-blue-600 to-blue-700 hover:from-blue-700 hover:to-blue-800 text-white shadow-lg transform hover:scale-105 animate-pulse'
-                      : !customStartDate || !customEndDate
-                      ? isDarkMode
-                        ? 'bg-gray-700 text-gray-500 cursor-not-allowed'
-                        : 'bg-gray-200 text-gray-400 cursor-not-allowed'
-                      : isDarkMode
-                      ? 'bg-green-600 hover:bg-green-700 text-white'
-                      : 'bg-green-600 hover:bg-green-700 text-white'
-                  }`}
-                >
-                  <Check className="h-4 w-4" />
-                  <span>
-                    {hasUnappliedChanges ? 'Apply Changes' : 'Applied'}
-                  </span>
-                </button>
-              </div>
-            </div>
-            
-            {/* Date Range Summary */}
-            {customStartDate && customEndDate && (
-              <div className={`mt-4 p-3 rounded-lg ${
-                isDarkMode ? 'bg-gray-700/50' : 'bg-blue-100/50'
-              }`}>
-                <p className={`text-sm ${textSecondaryClass}`}>
-                  Selected range: <span className={`font-medium ${textClass}`}>
-                    {new Date(customStartDate).toLocaleDateString()} - {new Date(customEndDate).toLocaleDateString()}
-                  </span>
-                  {appliedCustomDates.start && appliedCustomDates.end && (
-                    customStartDate === appliedCustomDates.start && customEndDate === appliedCustomDates.end
-                      ? <span className={`ml-2 text-green-600 ${isDarkMode ? 'text-green-400' : 'text-green-600'}`}>✓ Applied</span>
-                      : <span className={`ml-2 text-orange-600 ${isDarkMode ? 'text-orange-400' : 'text-orange-600'}`}>⚠ Click Apply to update</span>
-                  )}
+              {customStartDate && customEndDate && (
+                <p className="rounded-md bg-muted p-3 text-sm text-muted-foreground">
+                  Selected range: <span className="font-medium text-foreground">{new Date(customStartDate).toLocaleDateString()} – {new Date(customEndDate).toLocaleDateString()}</span>
+                  {appliedCustomDates.start && (customStartDate === appliedCustomDates.start && customEndDate === appliedCustomDates.end
+                    ? <span className="ml-2 text-success">✓ Applied</span>
+                    : <span className="ml-2 text-warning">⚠ Click Apply to update</span>)}
                 </p>
-              </div>
-            )}
-          </div>
+              )}
+            </CardContent>
+          </Card>
         )}
       </div>
 
-      {/* Detailed Metrics */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        <div className={`p-6 rounded-lg border ${cardBgClass} ${cardBorderClass}`}>
-          <h3 className={`text-lg font-semibold ${textClass} mb-4`}>Performance Metrics</h3>
+      {/* Detailed metrics — header/selector above always stay visible */}
+      {statsQ.isLoading ? (
+        <div className="py-10 text-center"><Spinner className="mx-auto" /><p className="mt-2 text-muted-foreground">Loading metrics…</p></div>
+      ) : needDates ? (
+        <div className="rounded-lg border border-dashed border-border py-10 text-center">
+          <Calendar className="mx-auto mb-2 h-8 w-8 text-muted-foreground" />
+          <p className="text-muted-foreground">Pick a start and end date above, then click <span className="font-medium text-foreground">Apply</span>.</p>
+        </div>
+      ) : !stats ? (
+        <div className="py-10 text-center text-muted-foreground">No metrics for this period.</div>
+      ) : (
+      <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
+        <Card><CardContent className="p-6">
+          <h3 className="mb-4 text-lg font-semibold text-foreground">Performance Metrics</h3>
           <div className="space-y-4">
-            <div 
-              className="flex justify-between items-center relative"
-              onMouseEnter={handleMouseEnter('Overall Equipment Effectiveness (Availability × Performance × Quality)')}
-              onMouseLeave={handleMouseLeave}
-              onMouseMove={handleMouseMove}
-            >
-              <span className={`flex items-center ${textSecondaryClass}`}>
-                OEE
-                <Info className="h-3 w-3 ml-1" />
-              </span>
-              <div className="flex items-center space-x-2">
-                <div className={`w-20 rounded-full h-2 ${isDarkMode ? 'bg-gray-700' : 'bg-gray-200'}`}>
-                  <div 
-                    className="bg-purple-500 h-2 rounded-full" 
-                    style={{ width: `${stats.oee}%` }}
-                  ></div>
-                </div>
-                <span className={`font-medium ${textClass}`}>
-                  {stats.oee}%
-                </span>
-              </div>
-            </div>
-           
-            <div 
-              className="flex justify-between items-center relative"
-              onMouseEnter={handleMouseEnter('Percentage of time the machine was available for production')}
-              onMouseLeave={handleMouseLeave}
-              onMouseMove={handleMouseMove}
-            >
-              <span className={`flex items-center ${textSecondaryClass}`}>
-                Availability
-                <Info className="h-3 w-3 ml-1" />
-              </span>
-              <div className="flex items-center space-x-2">
-                <div className={`w-20 rounded-full h-2 ${isDarkMode ? 'bg-gray-700' : 'bg-gray-200'}`}>
-                  <div 
-                    className="bg-green-500 h-2 rounded-full" 
-                    style={{ width: `${stats.availability}%` }}
-                  ></div>
-                </div>
-                <span className={`font-medium ${textClass}`}>{stats.availability}%</span>
-              </div>
-            </div>
-            
-            <div 
-              className="flex justify-between items-center relative"
-              onMouseEnter={handleMouseEnter('Actual production rate compared to the maximum possible rate')}
-              onMouseLeave={handleMouseLeave}
-              onMouseMove={handleMouseMove}
-            >
-              <span className={`flex items-center ${textSecondaryClass}`}>
-                Performance
-                <Info className="h-3 w-3 ml-1" />
-              </span>
-              <div className="flex items-center space-x-2">
-                <div className={`w-20 rounded-full h-2 ${isDarkMode ? 'bg-gray-700' : 'bg-gray-200'}`}>
-                  <div 
-                    className="bg-yellow-500 h-2 rounded-full" 
-                    style={{ width: `${stats.performance}%` }}
-                  ></div>
-                </div>
-                <span className={`font-medium ${textClass}`}>{stats.performance}%</span>
-              </div>
-            </div>
+            <MetricBar label="OEE" value={stats.oee} barClass="bg-primary" title="Availability × Performance × Quality" />
+            <MetricBar label="Availability" value={stats.availability} barClass="bg-success" title="Percentage of time the machine was available for production" />
+            <MetricBar label="Performance" value={stats.performance} barClass="bg-warning" title="Actual production rate vs. maximum possible rate" />
+            <MetricBar label="Quality" value={stats.quality} barClass="bg-info" title="Percentage of units meeting quality standards" />
+          </div>
+        </CardContent></Card>
 
-            <div 
-              className="flex justify-between items-center relative"
-              onMouseEnter={handleMouseEnter('Percentage of units that meet quality standards')}
-              onMouseLeave={handleMouseLeave}
-              onMouseMove={handleMouseMove}
-            >
-              <span className={`flex items-center ${textSecondaryClass}`}>
-                Quality
-                <Info className="h-3 w-3 ml-1" />
-              </span>
-              <div className="flex items-center space-x-2">
-                <div className={`w-20 rounded-full h-2 ${isDarkMode ? 'bg-gray-700' : 'bg-gray-200'}`}>
-                  <div 
-                    className="bg-blue-500 h-2 rounded-full" 
-                    style={{ width: `${stats.quality}%` }}
-                  ></div>
-                </div>
-                <span className={`font-medium ${textClass}`}>{stats.quality}%</span>
-              </div>
+        <Card><CardContent className="p-6">
+          <h3 className="mb-4 text-lg font-semibold text-foreground">Quality Metrics</h3>
+          <div className="space-y-4">
+            <div className="flex items-center justify-between" title="Units that passed quality inspection">
+              <span className="flex items-center gap-1 text-muted-foreground">Good Units<Info className="h-3 w-3" /></span>
+              <span className="font-medium text-success">{stats.totalUnitsProduced - stats.totalDefectiveUnits}</span>
+            </div>
+            <div className="flex items-center justify-between" title="Units that failed quality inspection">
+              <span className="flex items-center gap-1 text-muted-foreground">Defective Units<Info className="h-3 w-3" /></span>
+              <span className="font-medium text-destructive">{stats.totalDefectiveUnits}</span>
+            </div>
+            <div className="flex items-center justify-between" title="Percentage of units that were defective">
+              <span className="flex items-center gap-1 text-muted-foreground">Defect Rate<Info className="h-3 w-3" /></span>
+              <span className="font-medium text-warning">{defectRate}%</span>
             </div>
           </div>
-        </div>
+        </CardContent></Card>
 
-        <div className={`p-6 rounded-lg border ${cardBgClass} ${cardBorderClass}`}>
-          <h3 className={`text-lg font-semibold ${textClass} mb-4`}>Quality Metrics</h3>
+        <Card><CardContent className="p-6">
+          <h3 className="mb-4 text-lg font-semibold text-foreground">Reliability</h3>
           <div className="space-y-4">
-            <div 
-              className="flex justify-between items-center relative"
-              onMouseEnter={handleMouseEnter('Units that passed quality inspection')}
-              onMouseLeave={handleMouseLeave}
-              onMouseMove={handleMouseMove}
-            >
-              <span className={`flex items-center ${textSecondaryClass}`}>
-                Good Units
-                <Info className="h-3 w-3 ml-1" />
-              </span>
-              <span className={`font-medium ${isDarkMode ? 'text-green-400' : 'text-green-600'}`}>
-                {stats.totalUnitsProduced - stats.totalDefectiveUnits}
-              </span>
+            <div className="flex items-center justify-between" title="Current operational status of the machine">
+              <span className="flex items-center gap-1 text-muted-foreground">Current Status<Info className="h-3 w-3" /></span>
+              <span className={cn('font-medium capitalize', statusStyle(machine.status).split(' ')[0])}>{machine.status.replace(/_/g, ' ')}</span>
             </div>
-            <div 
-              className="flex justify-between items-center relative"
-              onMouseEnter={handleMouseEnter('Units that failed quality inspection')}
-              onMouseLeave={handleMouseLeave}
-              onMouseMove={handleMouseMove}
-            >
-              <span className={`flex items-center ${textSecondaryClass}`}>
-                Defective Units
-                <Info className="h-3 w-3 ml-1" />
-              </span>
-              <span className={`font-medium ${isDarkMode ? 'text-red-400' : 'text-red-600'}`}>{stats.totalDefectiveUnits}</span>
+            <div className="flex items-center justify-between" title="Mean Time Between Failures (selected period)">
+              <span className="flex items-center gap-1 text-muted-foreground">MTBF<Info className="h-3 w-3" /></span>
+              <span className="font-medium text-info">{stats.mtbf > 0 ? (stats.mtbf / 1440).toFixed(1) : 0} days</span>
             </div>
-            <div 
-              className="flex justify-between items-center relative"
-              onMouseEnter={handleMouseEnter('Percentage of units that were defective')}
-              onMouseLeave={handleMouseLeave}
-              onMouseMove={handleMouseMove}
-            >
-              <span className={`flex items-center ${textSecondaryClass}`}>
-                Defect Rate
-                <Info className="h-3 w-3 ml-1" />
-              </span>
-              <span className={`font-medium ${isDarkMode ? 'text-yellow-400' : 'text-amber-600'}`}>
-                {stats.totalUnitsProduced > 0 
-                  ? ((stats.totalDefectiveUnits / stats.totalUnitsProduced) * 100).toFixed(1)
-                  : 0
-                }%
-              </span>
+            <div className="flex items-center justify-between" title="Mean Time To Repair (selected period)">
+              <span className="flex items-center gap-1 text-muted-foreground">MTTR<Info className="h-3 w-3" /></span>
+              <span className="font-medium text-primary">{stats.mttr} minutes</span>
+            </div>
+            <div className="flex items-center justify-between" title="Total running time in the selected period">
+              <span className="flex items-center gap-1 text-muted-foreground">Running Time<Info className="h-3 w-3" /></span>
+              <span className="font-medium text-success">{Math.round((stats.totalRunningMinutes || 0) / 60 * 10) / 10}h</span>
             </div>
           </div>
-        </div>
-
-        <div className={`p-6 rounded-lg border ${cardBgClass} ${cardBorderClass}`}>
-          <h3 className={`text-lg font-semibold ${textClass} mb-4`}>Reliability</h3>
-          <div className="space-y-4">
-            <div 
-              className="flex justify-between items-center relative"
-              onMouseEnter={handleMouseEnter('Current operational status of the machine')}
-              onMouseLeave={handleMouseLeave}
-              onMouseMove={handleMouseMove}
-            >
-              <span className={`flex items-center ${textSecondaryClass}`}>
-                Current Status
-                <Info className="h-3 w-3 ml-1" />
-              </span>
-              <span className={`font-medium capitalize ${
-                machine.status === 'running' 
-                  ? isDarkMode ? 'text-green-400' : 'text-green-600' :
-                machine.status === 'inactive' 
-                  ? isDarkMode ? 'text-red-400' : 'text-red-600' :
-                machine.status === 'stopped_yet_producing' 
-                  ? isDarkMode ? 'text-orange-400' : 'text-orange-600' :
-                  isDarkMode ? 'text-red-400' : 'text-red-600'
-              }`}>
-                {machine.status}
-              </span>
-            </div>
-            <div 
-              className="flex justify-between items-center relative"
-              onMouseEnter={handleMouseEnter('Mean Time Between Failures in days (Year to Date)')}
-              onMouseLeave={handleMouseLeave}
-              onMouseMove={handleMouseMove}
-            >
-              <span className={`flex items-center ${textSecondaryClass}`}>
-                MTBF
-                <Info className="h-3 w-3 ml-1" />
-              </span>
-
-              <span className={`font-medium ${isDarkMode ? 'text-blue-400' : 'text-blue-600'}`}>{stats.mtbf > 0 ? (stats.mtbf / 1440).toFixed(1) : 0} days</span>
-            </div>
-            <div 
-              className="flex justify-between items-center relative"
-              onMouseEnter={handleMouseEnter('Mean Time To Repair in minutes (Year to Date)')}
-              onMouseLeave={handleMouseLeave}
-              onMouseMove={handleMouseMove}
-            >
-              <span className={`flex items-center ${textSecondaryClass}`}>
-                MTTR
-                <Info className="h-3 w-3 ml-1" />
-              </span>
-              <span className={`font-medium ${isDarkMode ? 'text-purple-400' : 'text-purple-600'}`}>{stats.mttr} minutes</span>
-            </div>
-            <div 
-              className="flex justify-between items-center relative"
-              onMouseEnter={handleMouseEnter('Total time the machine was running in the selected period')}
-              onMouseLeave={handleMouseLeave}
-              onMouseMove={handleMouseMove}
-            >
-              <span className={`flex items-center ${textSecondaryClass}`}>
-                Running Time
-                <Info className="h-3 w-3 ml-1" />
-              </span>
-              <span className={`font-medium ${isDarkMode ? 'text-green-400' : 'text-green-600'}`}>
-                {Math.round((stats.totalRunningMinutes || 0) / 60 * 10) / 10}h
-              </span>
-            </div>
-          </div>
-        </div>
+        </CardContent></Card>
       </div>
+      )}
 
-      {/* Production Timeline */}
-      <div className={`rounded-lg border ${cardBgClass} ${cardBorderClass}`}>
-        <div className={`p-6 border-b ${cardBorderClass}`}>
-          <h2 className={`text-lg font-semibold ${textClass}`}>Real-time Production Timeline</h2>
-          <p className={`text-sm mt-1 ${textSecondaryClass}`}>
-            Live production data with operator and mold information
-          </p>
+      {/* Production timeline */}
+      <Card>
+        <div className="border-b border-border p-6">
+          <h2 className="text-lg font-semibold text-foreground">Real-time Production Timeline</h2>
+          <p className="mt-1 text-sm text-muted-foreground">Live production data with operator and mold information</p>
         </div>
         <div className="p-6">
-          <ProductionTimeline 
-            machineId={id!}
-            onAddStoppage={handleAddStoppage}
-            onUpdateProduction={handleUpdateProduction}
-          />
+          <ProductionTimeline machineId={id!} onAddStoppage={handleAddStoppage} onUpdateProduction={handleUpdateProduction} />
         </div>
-      </div>
+      </Card>
     </div>
   );
 };

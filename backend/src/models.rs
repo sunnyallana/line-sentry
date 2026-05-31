@@ -25,6 +25,11 @@ pub const SIGNAL_DATA: &str = "signaldatas";
 pub const PRODUCTION_RECORDS: &str = "productionrecords";
 pub const REPORTS: &str = "reports";
 pub const CONFIGS: &str = "configs";
+pub const PLCS: &str = "plcs";
+
+/// Sentinel PLC id used when a mapping/payload doesn't name a PLC (single-PLC
+/// installs and legacy data).
+pub const DEFAULT_PLC: &str = "default";
 
 fn default_true() -> bool {
     true
@@ -352,8 +357,61 @@ pub struct SensorPinMapping {
     pub id: Option<Id>,
     #[serde(rename = "sensorId")]
     pub sensor_id: Id,
+    /// Which PLC this pin belongs to (the registry's `plcId`). Defaults to
+    /// `"default"` for single-PLC installs and pre-multi-PLC data.
+    #[serde(rename = "plcId", default = "default_plc_id")]
+    pub plc_id: String,
+    /// Pin address in Siemens byte.bit form, e.g. `"Q0.0"`, `"Q2.5"`.
     #[serde(rename = "pinId")]
-    pub pin_id: String, // e.g. "DQ.0"
+    pub pin_id: String,
+}
+
+fn default_plc_id() -> String {
+    DEFAULT_PLC.to_string()
+}
+
+/// A PLC the daemon(s) read from. Each exposes `8 * byte_count` output pins
+/// (Q0.0 … Q{byte_count-1}.7); mappings are scoped to its `plc_id`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Plc {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<Id>,
+    /// Stable slug the daemon posts under (e.g. "default", "line-1").
+    #[serde(rename = "plcId")]
+    pub plc_id: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ip: Option<String>,
+    #[serde(default)]
+    pub rack: i32,
+    #[serde(default = "default_slot")]
+    pub slot: i32,
+    /// Number of output bytes the daemon reads → `8 * byte_count` pins.
+    #[serde(rename = "byteCount", default = "default_byte_count")]
+    pub byte_count: i32,
+    #[serde(rename = "isActive", default = "default_true")]
+    pub is_active: bool,
+    #[serde(
+        rename = "createdAt",
+        with = "bson_dt_opt",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    pub created_at: Option<DateTime<Utc>>,
+    #[serde(
+        rename = "updatedAt",
+        with = "bson_dt_opt",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
+fn default_slot() -> i32 {
+    1
+}
+fn default_byte_count() -> i32 {
+    1
 }
 
 // ── SignalData ───────────────────────────────────────────────────────────────
@@ -518,10 +576,58 @@ pub async fn ensure_indexes(db: &Database) -> anyhow::Result<()> {
         .await?;
 
     // SensorPinMapping: unique pinId.
+    // ── Multi-PLC migration (idempotent) ──────────────────────────────────────
+    {
+        use futures::TryStreamExt;
+        let pins = db.collection::<bson::Document>(SENSOR_PIN_MAPPINGS);
+        // Scope legacy mappings to the default PLC.
+        pins.update_many(
+            doc! { "plcId": { "$exists": false } },
+            doc! { "$set": { "plcId": DEFAULT_PLC } },
+        )
+        .await
+        .ok();
+        // Rename legacy linear pins "DQ.N" → Siemens byte.bit "Q0.N".
+        if let Ok(mut cur) = pins.find(doc! { "pinId": { "$regex": "^DQ\\." } }).await {
+            while let Ok(Some(d)) = cur.try_next().await {
+                if let (Ok(id), Ok(pin)) = (d.get_object_id("_id"), d.get_str("pinId")) {
+                    if let Some(bit) = pin.strip_prefix("DQ.") {
+                        let new_pin = format!("Q0.{bit}");
+                        pins.update_one(doc! { "_id": id }, doc! { "$set": { "pinId": new_pin } })
+                            .await
+                            .ok();
+                    }
+                }
+            }
+        }
+        // Drop the old global-unique pinId index (replaced by a per-PLC one).
+        pins.drop_index("pinId_1").await.ok();
+        // Seed a default PLC if the registry is empty.
+        let plcs = db.collection::<bson::Document>(PLCS);
+        if plcs.count_documents(doc! {}).await.unwrap_or(0) == 0 {
+            plcs.insert_one(doc! {
+                "plcId": DEFAULT_PLC, "name": "Default PLC",
+                "rack": 0, "slot": 1, "byteCount": 2, "isActive": true,
+            })
+            .await
+            .ok();
+        }
+    }
+
+    // SensorPinMapping: a pin is unique within its PLC.
     db.collection::<SensorPinMapping>(SENSOR_PIN_MAPPINGS)
         .create_index(
             IndexModel::builder()
-                .keys(doc! { "pinId": 1 })
+                .keys(doc! { "plcId": 1, "pinId": 1 })
+                .options(unique.clone())
+                .build(),
+        )
+        .await?;
+    // PLC registry: unique plcId.
+    db.collection::<Plc>(PLCS)
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "plcId": 1 })
                 .options(unique.clone())
                 .build(),
         )

@@ -28,6 +28,10 @@ pub struct Config {
     pub rate_limit_window: Duration,
     pub rate_limit_auth_max: u32,
     pub rate_limit_general_max: u32,
+    /// Minutes east of UTC used to bucket production into factory-local
+    /// hour/day. Defaults to the server's local offset; override with
+    /// `FACTORY_UTC_OFFSET_MINUTES` (e.g. `300` for UTC+5).
+    pub factory_offset_minutes: i64,
 }
 
 fn require(key: &str) -> anyhow::Result<String> {
@@ -93,6 +97,13 @@ impl Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or(300);
 
+        // Factory timezone offset: explicit env var wins, else fall back to the
+        // host's local offset so single-host on-prem installs work out of the box.
+        let factory_offset_minutes = env::var("FACTORY_UTC_OFFSET_MINUTES")
+            .ok()
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .unwrap_or_else(|| (chrono::Local::now().offset().local_minus_utc() as i64) / 60);
+
         Ok(Self {
             bind_addr,
             mongodb_uri,
@@ -107,7 +118,20 @@ impl Config {
             rate_limit_window,
             rate_limit_auth_max,
             rate_limit_general_max,
+            factory_offset_minutes,
         })
+    }
+
+    /// Factory-local offset as a chrono duration (east of UTC).
+    pub fn factory_offset(&self) -> chrono::Duration {
+        chrono::Duration::minutes(self.factory_offset_minutes)
+    }
+
+    /// "Now" in factory-local wall-clock, stored in a UTC type. Used for
+    /// bucketing/labeling so hours/days match the factory floor, while elapsed
+    /// time math (which subtracts two such values) stays offset-invariant.
+    pub fn factory_now(&self) -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc::now() + self.factory_offset()
     }
 }
 

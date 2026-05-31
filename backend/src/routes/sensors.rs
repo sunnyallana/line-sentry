@@ -199,6 +199,8 @@ pub struct PinMappingReq {
     sensor_id: Id,
     #[serde(rename = "pinId")]
     pin_id: String,
+    #[serde(rename = "plcId")]
+    plc_id: Option<String>,
 }
 
 pub async fn create_pin_mapping(
@@ -206,13 +208,18 @@ pub async fn create_pin_mapping(
     State(state): State<AppState>,
     Json(body): Json<PinMappingReq>,
 ) -> AppResult<(StatusCode, Json<SensorPinMapping>)> {
+    let plc_id = body
+        .plc_id
+        .clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_PLC.to_string());
     let coll = state.db.collection::<SensorPinMapping>(SENSOR_PIN_MAPPINGS);
     if coll
-        .find_one(doc! { "pinId": &body.pin_id })
+        .find_one(doc! { "plcId": &plc_id, "pinId": &body.pin_id })
         .await?
         .is_some()
     {
-        return Err(AppError::bad_request("Pin is already occupied"));
+        return Err(AppError::bad_request("That pin is already in use on this PLC"));
     }
     if coll
         .find_one(doc! { "sensorId": body.sensor_id.oid() })
@@ -224,6 +231,7 @@ pub async fn create_pin_mapping(
     let mut mapping = SensorPinMapping {
         id: None,
         sensor_id: body.sensor_id,
+        plc_id,
         pin_id: body.pin_id,
     };
     let res = coll.insert_one(&mapping).await?;
