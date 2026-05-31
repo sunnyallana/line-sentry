@@ -3,7 +3,9 @@ mod config;
 mod db;
 mod error;
 mod models;
+mod pipeline;
 mod ratelimit;
+mod realtime;
 mod routes;
 mod state;
 
@@ -14,9 +16,8 @@ use axum::extract::State;
 use axum::http::{HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware::from_fn_with_state;
 use axum::response::IntoResponse;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
-use mongodb::Database;
 use serde_json::json;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
@@ -37,13 +38,22 @@ async fn main() -> anyhow::Result<()> {
         eprintln!("FATAL: {e}");
     })?);
 
-    // Connect to MongoDB, retrying with backoff until it is reachable.
-    let db = connect_with_retry(&config).await;
+    // Build the (lazily-connecting) MongoDB handle.
+    let db = db::connect(&config).await?;
 
-    // Ensure indexes (non-fatal: a conflicting/legacy index shouldn't block boot).
-    if let Err(e) = models::ensure_indexes(&db).await {
-        tracing::warn!("failed to ensure indexes: {e:#}");
+    // Ensure indexes in the background so a momentarily-unavailable DB doesn't
+    // delay serving (non-fatal: a legacy/conflicting index shouldn't block boot).
+    {
+        let db = db.clone();
+        tokio::spawn(async move {
+            if let Err(e) = models::ensure_indexes(&db).await {
+                tracing::warn!("failed to ensure indexes (will retry on next boot): {e:#}");
+            }
+        });
     }
+
+    // Socket.IO layer + handle (the handle goes into AppState so handlers emit).
+    let (socket_layer, io) = realtime::build();
 
     let state = AppState {
         db,
@@ -59,14 +69,37 @@ async fn main() -> anyhow::Result<()> {
             config.rate_limit_window,
             config.rate_limit_general_max,
         )),
+        io,
+        pipeline: Arc::new(pipeline::PipelineState::new()),
     };
 
-    let app = build_router(state, &config);
+    // Background monitor: tick ongoing unclassified-stoppage durations every 60s
+    // (replaces the per-request setInterval that leaked timers in the Node app).
+    {
+        let monitor_state = state.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(60));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                pipeline::update_ongoing_stoppages(&monitor_state, chrono::Utc::now()).await;
+            }
+        });
+    }
+
+    // CORS and the Socket.IO layer wrap the router from the outside so that
+    // CORS headers also apply to the /socket.io/ polling transport.
+    let app = build_router(state)
+        .layer(socket_layer)
+        .layer(build_cors(&config));
 
     let listener = tokio::net::TcpListener::bind(&config.bind_addr)
         .await
         .map_err(|e| anyhow::anyhow!("binding {}: {e}", config.bind_addr))?;
-    tracing::info!("LineSentry backend listening on http://{}", config.bind_addr);
+    tracing::info!(
+        "LineSentry backend listening on http://{}",
+        config.bind_addr
+    );
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
@@ -76,28 +109,148 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn build_router(state: AppState, config: &Config) -> Router {
+fn build_router(state: AppState) -> Router {
     // Auth routes; the login route carries the strict per-IP limiter.
     let auth_routes = Router::new()
         .route(
             "/login",
-            post(routes::auth::login)
-                .route_layer(from_fn_with_state(state.clone(), ratelimit::login_rate_limit)),
+            post(routes::auth::login).route_layer(from_fn_with_state(
+                state.clone(),
+                ratelimit::login_rate_limit,
+            )),
         )
         .route("/me", get(routes::auth::me))
         .route("/init-demo", post(routes::auth::init_demo));
+
+    // Signal routes. /pin-data is guarded by the daemon API key (in-handler);
+    // it is exempt from the general rate limiter (high-frequency ingestion).
+    let signal_routes = Router::new()
+        .route("/pin-data", post(routes::signals::pin_data))
+        .route(
+            "/unclassified-stoppages-count",
+            get(routes::signals::unclassified_stoppages_count),
+        )
+        .route("/machine/{machineId}/recent", get(routes::signals::recent))
+        .route("/", post(routes::signals::post_signal));
+
+    let department_routes = Router::new()
+        .route(
+            "/",
+            get(routes::departments::list).post(routes::departments::create),
+        )
+        .route("/admin/all", get(routes::departments::admin_all))
+        .route(
+            "/{id}",
+            get(routes::departments::get_one)
+                .put(routes::departments::update)
+                .delete(routes::departments::delete),
+        );
+
+    let machine_routes = Router::new()
+        .route(
+            "/",
+            get(routes::machines::list).post(routes::machines::create),
+        )
+        .route(
+            "/department/{departmentId}",
+            get(routes::machines::by_department),
+        )
+        .route("/{id}/position", patch(routes::machines::position))
+        .route(
+            "/{id}",
+            get(routes::machines::get_one)
+                .put(routes::machines::update)
+                .delete(routes::machines::delete),
+        );
+
+    let sensor_routes = Router::new()
+        .route(
+            "/",
+            get(routes::sensors::list).post(routes::sensors::create),
+        )
+        .route("/admin/all", get(routes::sensors::admin_all))
+        .route("/machine/{machineId}", get(routes::sensors::by_machine))
+        .route("/pin-mappings", get(routes::sensors::pin_mappings))
+        .route("/pin-mapping", post(routes::sensors::create_pin_mapping))
+        .route(
+            "/pin-mapping/{id}",
+            delete(routes::sensors::delete_pin_mapping),
+        )
+        .route(
+            "/{id}",
+            put(routes::sensors::update).delete(routes::sensors::delete),
+        );
+
+    let mold_routes = Router::new()
+        .route("/", get(routes::molds::list).post(routes::molds::create))
+        .route("/admin/all", get(routes::molds::admin_all))
+        .route("/{id}/status", patch(routes::molds::toggle_status))
+        .route(
+            "/{id}",
+            put(routes::molds::update).delete(routes::molds::delete),
+        );
+
+    let user_routes = Router::new()
+        .route("/", get(routes::users::list).post(routes::users::create))
+        .route("/admin/all", get(routes::users::admin_all))
+        .route(
+            "/{id}",
+            put(routes::users::update).delete(routes::users::delete),
+        );
+
+    let config_routes = Router::new()
+        .route("/", get(routes::config::get).put(routes::config::update))
+        .route("/shifts", get(routes::config::shifts));
+
+    let analytics_routes = Router::new()
+        .route(
+            "/production-timeline/{machineId}",
+            get(routes::analytics::production_timeline),
+        )
+        .route(
+            "/machine-stats/{machineId}",
+            get(routes::analytics::machine_stats),
+        )
+        .route(
+            "/department-stats/{departmentId}",
+            get(routes::analytics::department_stats),
+        )
+        .route("/factory-stats", get(routes::analytics::factory_stats))
+        .route("/stoppage", post(routes::analytics::add_stoppage))
+        .route(
+            "/production-assignment",
+            post(routes::analytics::production_assignment),
+        );
+
+    let report_routes = Router::new()
+        .route("/", get(routes::reports::list))
+        .route("/generate", post(routes::reports::generate))
+        .route("/{id}", delete(routes::reports::delete))
+        .route("/{id}/pdf", get(routes::reports::reports_pdf))
+        .route("/{id}/email", post(routes::reports::reports_email));
 
     Router::new()
         .route("/api/health", get(health))
         .route("/api/ready", get(ready))
         .nest("/api/auth", auth_routes)
+        .nest("/api/signals", signal_routes)
+        .nest("/api/departments", department_routes)
+        .nest("/api/machines", machine_routes)
+        .nest("/api/sensors", sensor_routes)
+        .nest("/api/molds", mold_routes)
+        .nest("/api/users", user_routes)
+        .nest("/api/config", config_routes)
+        .nest("/api/analytics", analytics_routes)
+        .nest("/api/reports", report_routes)
         // General limiter wraps the whole API (it internally exempts /api/signals
         // and the probes).
-        .layer(from_fn_with_state(state.clone(), ratelimit::general_rate_limit))
+        .layer(from_fn_with_state(
+            state.clone(),
+            ratelimit::general_rate_limit,
+        ))
         .layer(TraceLayer::new_for_http())
         .layer(CompressionLayer::new())
         .layer(RequestBodyLimitLayer::new(1024 * 1024))
-        .layer(build_cors(config))
         .with_state(state)
 }
 
@@ -148,27 +301,10 @@ async fn ready(State(state): State<AppState>) -> impl IntoResponse {
     if db::ping(&state.db).await {
         (StatusCode::OK, Json(json!({ "ready": true })))
     } else {
-        (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "ready": false })))
-    }
-}
-
-async fn connect_with_retry(config: &Config) -> Database {
-    let mut attempt: u32 = 0;
-    loop {
-        attempt += 1;
-        match db::connect(config).await {
-            Ok(db) => {
-                tracing::info!("connected to MongoDB");
-                return db;
-            }
-            Err(e) => {
-                let delay = std::cmp::min(30, 2u64.pow(attempt.min(5)));
-                tracing::error!(
-                    "MongoDB connection failed (attempt {attempt}): {e:#}. retrying in {delay}s"
-                );
-                tokio::time::sleep(Duration::from_secs(delay)).await;
-            }
-        }
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "ready": false })),
+        )
     }
 }
 

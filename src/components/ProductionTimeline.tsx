@@ -51,8 +51,6 @@ const ProductionModal: React.FC<ProductionModalProps> = ({
   hour,
   date,
   machineId,
-  onAddStoppage,
-  onUpdateProduction,
   availableOperators = [],
   availableMolds = [],
   shifts = []
@@ -82,7 +80,6 @@ const ProductionModal: React.FC<ProductionModalProps> = ({
   const [showMoldResults, setShowMoldResults] = useState(false);
   
   // Theme classes
-  const bgClass = isDarkMode ? 'bg-gray-900' : 'bg-gray-50';
   const cardBgClass = isDarkMode ? 'bg-gray-800' : 'bg-white';
   const cardBorderClass = isDarkMode ? 'border-gray-700' : 'border-gray-200';
   const textClass = isDarkMode ? 'text-white' : 'text-gray-900';

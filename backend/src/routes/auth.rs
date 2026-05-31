@@ -20,7 +20,10 @@ pub struct LoginReq {
     captcha_token: Option<String>,
 }
 
-pub async fn login(State(state): State<AppState>, Json(body): Json<LoginReq>) -> AppResult<Json<Value>> {
+pub async fn login(
+    State(state): State<AppState>,
+    Json(body): Json<LoginReq>,
+) -> AppResult<Json<Value>> {
     let username = body.username.unwrap_or_default();
     let password = body.password.unwrap_or_default();
     if username.is_empty() || password.is_empty() {
@@ -111,8 +114,13 @@ pub async fn init_demo(State(state): State<AppState>) -> AppResult<Json<Value>> 
         .collection::<Department>(DEPARTMENTS)
         .find_one(doc! { "name": "Manufacturing Department" })
         .await?
-        .ok_or_else(|| AppError::Internal(anyhow::anyhow!("demo department not found after upsert")))?;
-    let dept_id: Bson = dept.id.map(|i| Bson::ObjectId(i.oid())).unwrap_or(Bson::Null);
+        .ok_or_else(|| {
+            AppError::Internal(anyhow::anyhow!("demo department not found after upsert"))
+        })?;
+    let dept_id: Bson = dept
+        .id
+        .map(|i| Bson::ObjectId(i.oid()))
+        .unwrap_or(Bson::Null);
 
     let users = state.db.collection::<Document>(USERS);
     let admin_hash = auth::hash_password("admin123")?;
@@ -146,7 +154,9 @@ pub async fn init_demo(State(state): State<AppState>) -> AppResult<Json<Value>> 
         .upsert(true)
         .await?;
 
-    Ok(Json(json!({ "message": "Demo accounts initialized successfully" })))
+    Ok(Json(
+        json!({ "message": "Demo accounts initialized successfully" }),
+    ))
 }
 
 /// Fetch the user's department document (mirrors Mongoose `.populate`).

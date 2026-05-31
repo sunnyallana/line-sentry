@@ -23,7 +23,12 @@ pub struct Claims {
     pub exp: usize,
 }
 
-pub fn sign_jwt(user_id: &str, role: &str, secret: &str, ttl: Duration) -> Result<String, AppError> {
+pub fn sign_jwt(
+    user_id: &str,
+    role: &str,
+    secret: &str,
+    ttl: Duration,
+) -> Result<String, AppError> {
     let exp = Utc::now().timestamp() as usize + ttl.as_secs() as usize;
     let claims = Claims {
         user_id: user_id.to_string(),
@@ -123,6 +128,26 @@ impl FromRequestParts<AppState> for AuthUser {
     }
 }
 
+/// Extractor: validates the daemon's `X-API-Key` (machine-to-machine ingestion).
+pub struct DaemonKey;
+
+impl FromRequestParts<AppState> for DaemonKey {
+    type Rejection = AppError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, AppError> {
+        let provided = parts
+            .headers
+            .get("x-api-key")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if verify_api_key(provided.as_bytes(), state.config.daemon_api_key.as_bytes()) {
+            Ok(DaemonKey)
+        } else {
+            Err(AppError::Auth("Invalid or missing API key".into()))
+        }
+    }
+}
+
 /// Extractor: an authenticated user with the `admin` role.
 pub struct AdminUser(pub User);
 
@@ -154,8 +179,13 @@ mod tests {
     #[test]
     fn jwt_round_trip() {
         let secret = "test-secret";
-        let token = sign_jwt("65a1f2c3d4e5f60718293a4b", "admin", secret, Duration::from_secs(60))
-            .unwrap();
+        let token = sign_jwt(
+            "65a1f2c3d4e5f60718293a4b",
+            "admin",
+            secret,
+            Duration::from_secs(60),
+        )
+        .unwrap();
         let claims = verify_jwt(&token, secret).unwrap();
         assert_eq!(claims.user_id, "65a1f2c3d4e5f60718293a4b");
         assert_eq!(claims.role, "admin");

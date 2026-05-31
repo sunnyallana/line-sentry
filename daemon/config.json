@@ -1,0 +1,12 @@
+{
+  "backend": { "url": "http://localhost:3001" },
+  "daemon": {
+    "interval_seconds": 1,
+    "retry_attempts": 3,
+    "retry_delay": 5,
+    "request_timeout": 10,
+    "api_key": "",
+    "source": "simulator"
+  },
+  "plc": { "ip": "192.168.0.1", "rack": 0, "slot": 1 }
+}

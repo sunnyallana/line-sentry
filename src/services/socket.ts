@@ -1,8 +1,67 @@
 import { io, Socket } from 'socket.io-client';
 
-// Socket server URL. Falls back to localhost for local dev; set VITE_SOCKET_URL
-// in production (see .env.example).
-const SOCKET_URL = import.meta.env.VITE_SOCKET_URL || 'http://localhost:3001';
+// Socket server URL. When VITE_SOCKET_URL is set (e.g. http://localhost:3001 in
+// local dev) we connect there; when empty we connect same-origin, which is how
+// production runs behind nginx (it proxies /socket.io to the backend).
+const SOCKET_URL = import.meta.env.VITE_SOCKET_URL || '';
+
+/** Typed payloads for the realtime events the backend emits. */
+export interface SocketEventMap {
+  'power-signal': { machineId: string; value: number; timestamp: string };
+  'machine-state-update': {
+    machineId: string;
+    status: string;
+    color: string;
+    hasPower: boolean;
+    hasCycle: boolean;
+    dbStatus: string;
+    timestamp: string;
+  };
+  'production-update': {
+    machineId: string;
+    hour: number;
+    date: string;
+    unitsProduced: number;
+    status: string;
+    runningMinutes: number;
+    stoppageMinutes: number;
+    timestamp: string;
+  };
+  'running-time-update': {
+    machineId: string;
+    hour: number;
+    date: string;
+    runningMinutes: number;
+    timestamp: string;
+  };
+  'unclassified-stoppage-detected': {
+    machineId: string;
+    hour: number;
+    date: string;
+    stoppageStart: string;
+    pendingStoppageId: string;
+    timestamp: string;
+  };
+  'stoppage-resolved': { machineId: string; timestamp: string };
+  'stoppage-updated': {
+    machineId: string;
+    hour: number;
+    date: string;
+    stoppageId: string;
+    duration: number;
+  };
+  'stoppage-added': { machineId: string; hour: number; date: string; stoppage: unknown; timestamp: string };
+  'production-assignment-updated': {
+    machineId: string;
+    hours: number[];
+    date: string;
+    operatorId: string | null;
+    moldId: string | null;
+    originalHour: number;
+    defectiveUnits?: number;
+    timestamp: string;
+  };
+}
 
 class SocketService {
   private socket: Socket | null = null;
@@ -11,9 +70,8 @@ class SocketService {
   connect() {
     if (this.socket?.connected) return;
 
-    this.socket = io(SOCKET_URL, {
-      transports: ['websocket', 'polling']
-    });
+    const opts = { transports: ['websocket', 'polling'] as string[] };
+    this.socket = SOCKET_URL ? io(SOCKET_URL, opts) : io(opts);
 
     this.socket.on('connect', () => {
       console.log('Connected to server');
@@ -26,7 +84,7 @@ class SocketService {
     // Re-register all listeners
     this.listeners.forEach((callbacks, event) => {
       callbacks.forEach(callback => {
-        this.socket?.on(event, callback);
+        this.socket?.on(event, callback as any);
       });
     });
   }
@@ -44,7 +102,9 @@ class SocketService {
     }
     this.listeners.get(event)!.push(callback);
 
-    if (this.socket?.connected) {
+    // Attach whenever a socket exists (handlers may be registered before the
+    // 'connect' event fires; socket.io attaches them correctly either way).
+    if (this.socket) {
       this.socket.on(event, callback as any);
     }
   }
@@ -56,12 +116,12 @@ class SocketService {
       if (index > -1) {
         callbacks.splice(index, 1);
       }
-      if (this.socket?.connected) {
+      if (this.socket) {
         this.socket.off(event, callback as any);
       }
     } else {
       this.listeners.delete(event);
-      if (this.socket?.connected) {
+      if (this.socket) {
         this.socket.off(event);
       }
     }

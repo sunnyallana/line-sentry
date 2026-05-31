@@ -33,7 +33,9 @@ pub struct Config {
 fn require(key: &str) -> anyhow::Result<String> {
     match env::var(key) {
         Ok(v) if !v.trim().is_empty() => Ok(v),
-        _ => anyhow::bail!("missing required environment variable: {key} (see backend/.env.example)"),
+        _ => {
+            anyhow::bail!("missing required environment variable: {key} (see backend/.env.example)")
+        }
     }
 }
 
@@ -49,8 +51,9 @@ impl Config {
         let mongodb_uri = require("MONGODB_URI")?;
         let daemon_api_key = require("DAEMON_API_KEY")?;
 
-        let recaptcha_secret =
-            env::var("RECAPTCHA_SECRET_KEY").ok().filter(|s| !s.trim().is_empty());
+        let recaptcha_secret = env::var("RECAPTCHA_SECRET_KEY")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
         if is_production && recaptcha_secret.is_none() {
             anyhow::bail!("RECAPTCHA_SECRET_KEY is required when APP_ENV/NODE_ENV=production");
         }
@@ -124,5 +127,7 @@ fn parse_duration(s: &str) -> Option<Duration> {
         // No recognised unit suffix: treat the whole string as seconds.
         _ => return s.parse::<u64>().ok().map(Duration::from_secs),
     };
-    num.parse::<u64>().ok().map(|n| Duration::from_secs(n * mult))
+    num.parse::<u64>()
+        .ok()
+        .map(|n| Duration::from_secs(n * mult))
 }

@@ -38,6 +38,11 @@ chrono = { version = "0.4", features = ["serde"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 dotenvy = "0.15"
 futures = "0.3"
+dashmap = "6"
+
+# Reports: PDF generation + email
+printpdf = "0.7"
+lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls-tls", "hostname"] }
 
 [profile.release]
 opt-level = 3

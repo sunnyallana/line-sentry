@@ -48,10 +48,13 @@ impl AppError {
             AppError::NotFound => (StatusCode::NOT_FOUND, "Not found".into()),
             AppError::BadRequest(m) => (StatusCode::BAD_REQUEST, m.clone()),
             AppError::Conflict(m) => (StatusCode::CONFLICT, m.clone()),
-            AppError::TooManyRequests => (StatusCode::TOO_MANY_REQUESTS, "Too many requests".into()),
-            AppError::Mongo(_) | AppError::Internal(_) => {
-                (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error".into())
+            AppError::TooManyRequests => {
+                (StatusCode::TOO_MANY_REQUESTS, "Too many requests".into())
             }
+            AppError::Mongo(_) | AppError::Internal(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal server error".into(),
+            ),
         }
     }
 }

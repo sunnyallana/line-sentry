@@ -91,9 +91,6 @@ const Reports: React.FC = () => {
   const buttonPrimaryClass = isDarkMode 
     ? 'bg-blue-600 hover:bg-blue-700' 
     : 'bg-blue-600 hover:bg-blue-700';
-  const buttonSecondaryClass = isDarkMode 
-    ? 'border-gray-600 text-gray-300 hover:bg-gray-700' 
-    : 'border-gray-300 text-gray-700 hover:bg-gray-50';
 
   useEffect(() => {
     fetchData();

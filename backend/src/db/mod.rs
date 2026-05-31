@@ -9,7 +9,9 @@ use mongodb::{Client, Database};
 
 use crate::config::Config;
 
-/// Connect to MongoDB with a pooled client and verify connectivity with a ping.
+/// Build a pooled MongoDB client/handle. The driver connects lazily and in the
+/// background, so this returns immediately even if the server is momentarily
+/// down — the HTTP server can start serving and `/health` reflects DB status.
 pub async fn connect(config: &Config) -> anyhow::Result<Database> {
     let mut opts = ClientOptions::parse(&config.mongodb_uri)
         .await
@@ -20,13 +22,7 @@ pub async fn connect(config: &Config) -> anyhow::Result<Database> {
     opts.app_name = Some("linesentry-backend".to_string());
 
     let client = Client::with_options(opts).context("building MongoDB client")?;
-    let db = client.database(&config.db_name);
-
-    db.run_command(doc! { "ping": 1 })
-        .await
-        .context("pinging MongoDB")?;
-
-    Ok(db)
+    Ok(client.database(&config.db_name))
 }
 
 /// Quick connectivity probe used by the health/readiness endpoints.

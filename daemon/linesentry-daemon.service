@@ -1,0 +1,21 @@
+[Unit]
+Description=LineSentry edge daemon (PLC signal ingestion)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=iot
+WorkingDirectory=/opt/linesentry-daemon
+EnvironmentFile=-/opt/linesentry-daemon/.env
+ExecStart=/opt/linesentry-daemon/linesentry-daemon
+Restart=always
+RestartSec=5
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/linesentry-daemon
+
+[Install]
+WantedBy=multi-user.target

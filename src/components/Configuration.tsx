@@ -110,8 +110,6 @@ const Configuration: React.FC = () => {
     handleSubmit,
     reset,
     formState: { errors },
-    setValue,
-    watch
   } = methods;
 
   const { fields, append, remove } = useFieldArray({

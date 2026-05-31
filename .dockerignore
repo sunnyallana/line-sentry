@@ -1,0 +1,18 @@
+# Frontend build context (repo root) — keep it lean and exclude other services.
+node_modules
+dist
+.git
+backend
+server
+daemon
+python-daemon
+deploy
+docs
+sample
+factory-layout
+target
+**/target
+*.log
+.env
+*.env
+!.env.example

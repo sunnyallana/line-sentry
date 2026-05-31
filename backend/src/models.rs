@@ -30,6 +30,58 @@ fn default_true() -> bool {
     true
 }
 
+// ── Date (de)serialization ───────────────────────────────────────────────────
+// chrono's own serde always emits an RFC3339 *string*, which MongoDB would store
+// as a BSON String (breaking date-range queries). These `#[serde(with = ...)]`
+// helpers store a native BSON Date for the driver (non-human-readable) while
+// still emitting an ISO-8601 string for the JSON API (human-readable).
+pub mod bson_dt {
+    use chrono::{DateTime, Utc};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(dt: &DateTime<Utc>, s: S) -> Result<S::Ok, S::Error> {
+        if s.is_human_readable() {
+            s.serialize_str(&dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+        } else {
+            bson::DateTime::from_chrono(*dt).serialize(s)
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<DateTime<Utc>, D::Error> {
+        if d.is_human_readable() {
+            let s = String::deserialize(d)?;
+            DateTime::parse_from_rfc3339(&s)
+                .map(|x| x.with_timezone(&Utc))
+                .map_err(serde::de::Error::custom)
+        } else {
+            bson::DateTime::deserialize(d).map(|b| b.to_chrono())
+        }
+    }
+}
+
+pub mod bson_dt_opt {
+    use chrono::{DateTime, Utc};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &Option<DateTime<Utc>>, s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            Some(dt) => super::bson_dt::serialize(dt, s),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<DateTime<Utc>>, D::Error> {
+        if d.is_human_readable() {
+            Ok(Option::<String>::deserialize(d)?
+                .map(|s| DateTime::parse_from_rfc3339(&s).map(|x| x.with_timezone(&Utc)))
+                .transpose()
+                .map_err(serde::de::Error::custom)?)
+        } else {
+            Ok(Option::<bson::DateTime>::deserialize(d)?.map(|b| b.to_chrono()))
+        }
+    }
+}
+
 // ── Id: ObjectId in BSON, hex string in JSON ─────────────────────────────────
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Id(pub ObjectId);
@@ -106,9 +158,19 @@ pub struct User {
     pub department_id: Option<Id>,
     #[serde(rename = "isActive", default = "default_true")]
     pub is_active: bool,
-    #[serde(rename = "createdAt", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "createdAt",
+        with = "bson_dt_opt",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
     pub created_at: Option<DateTime<Utc>>,
-    #[serde(rename = "updatedAt", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "updatedAt",
+        with = "bson_dt_opt",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
     pub updated_at: Option<DateTime<Utc>>,
 }
 
@@ -153,9 +215,19 @@ pub struct Department {
     pub layout: bson::Bson,
     #[serde(rename = "isActive", default = "default_true")]
     pub is_active: bool,
-    #[serde(rename = "createdAt", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "createdAt",
+        with = "bson_dt_opt",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
     pub created_at: Option<DateTime<Utc>>,
-    #[serde(rename = "updatedAt", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "updatedAt",
+        with = "bson_dt_opt",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
     pub updated_at: Option<DateTime<Utc>>,
 }
 
@@ -193,9 +265,19 @@ pub struct Machine {
     pub status: String, // running | stoppage | stopped_yet_producing | inactive
     #[serde(rename = "isActive", default = "default_true")]
     pub is_active: bool,
-    #[serde(rename = "createdAt", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "createdAt",
+        with = "bson_dt_opt",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
     pub created_at: Option<DateTime<Utc>>,
-    #[serde(rename = "updatedAt", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "updatedAt",
+        with = "bson_dt_opt",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
     pub updated_at: Option<DateTime<Utc>>,
 }
 
@@ -217,9 +299,19 @@ pub struct Mold {
     pub department_id: Id,
     #[serde(rename = "isActive", default = "default_true")]
     pub is_active: bool,
-    #[serde(rename = "createdAt", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "createdAt",
+        with = "bson_dt_opt",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
     pub created_at: Option<DateTime<Utc>>,
-    #[serde(rename = "updatedAt", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "updatedAt",
+        with = "bson_dt_opt",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
     pub updated_at: Option<DateTime<Utc>>,
 }
 
@@ -237,9 +329,19 @@ pub struct Sensor {
     pub sensor_type: String, // "power" | "unit-cycle"
     #[serde(rename = "isActive", default = "default_true")]
     pub is_active: bool,
-    #[serde(rename = "createdAt", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "createdAt",
+        with = "bson_dt_opt",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
     pub created_at: Option<DateTime<Utc>>,
-    #[serde(rename = "updatedAt", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "updatedAt",
+        with = "bson_dt_opt",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
     pub updated_at: Option<DateTime<Utc>>,
 }
 
@@ -264,6 +366,7 @@ pub struct SignalData {
     #[serde(rename = "machineId")]
     pub machine_id: Id,
     pub value: f64,
+    #[serde(with = "bson_dt")]
     pub timestamp: DateTime<Utc>,
 }
 
@@ -275,11 +378,24 @@ pub struct Stoppage {
     pub reason: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    #[serde(rename = "sapNotificationNumber", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "sapNotificationNumber",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub sap_notification_number: Option<String>,
-    #[serde(rename = "startTime", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "startTime",
+        with = "bson_dt_opt",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
     pub start_time: Option<DateTime<Utc>>,
-    #[serde(rename = "endTime", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "endTime",
+        with = "bson_dt_opt",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
     pub end_time: Option<DateTime<Utc>>,
     #[serde(default)]
     pub duration: f64,
@@ -324,14 +440,38 @@ pub struct ProductionRecord {
     pub units_produced: f64,
     #[serde(rename = "defectiveUnits", default)]
     pub defective_units: f64,
-    #[serde(rename = "startTime")]
+    #[serde(rename = "startTime", with = "bson_dt")]
     pub start_time: DateTime<Utc>,
-    #[serde(rename = "endTime", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "endTime",
+        with = "bson_dt_opt",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
     pub end_time: Option<DateTime<Utc>>,
     #[serde(rename = "hourlyData", default)]
     pub hourly_data: Vec<HourlyData>,
-    #[serde(rename = "lastActivityTime", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "lastActivityTime",
+        with = "bson_dt_opt",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
     pub last_activity_time: Option<DateTime<Utc>>,
+    #[serde(
+        rename = "createdAt",
+        with = "bson_dt_opt",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    pub created_at: Option<DateTime<Utc>>,
+    #[serde(
+        rename = "updatedAt",
+        with = "bson_dt_opt",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    pub updated_at: Option<DateTime<Utc>>,
 }
 
 // ── Config (+ nested) ────────────────────────────────────────────────────────
@@ -440,5 +580,38 @@ mod tests {
         );
         let back: Wrap = bson::from_slice(&bytes).unwrap();
         assert_eq!(back.id, id);
+    }
+
+    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    struct DateWrap {
+        #[serde(with = "bson_dt")]
+        t: chrono::DateTime<Utc>,
+    }
+
+    #[test]
+    fn date_serializes_as_iso_in_json_and_bson_date_on_the_wire() {
+        let t = chrono::DateTime::parse_from_rfc3339("2026-05-31T12:34:56.000Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let w = DateWrap { t };
+
+        // JSON → ISO-8601 string, round-trips.
+        let json = serde_json::to_value(&w).unwrap();
+        assert_eq!(json["t"], serde_json::json!("2026-05-31T12:34:56.000Z"));
+        let from_json: DateWrap = serde_json::from_value(json).unwrap();
+        assert_eq!(from_json, w);
+
+        // Driver wire → native BSON Date (NOT a string), round-trips. This guards
+        // the bug where chrono's default serde stored dates as strings, breaking
+        // date-range queries.
+        let bytes = bson::to_vec(&w).unwrap();
+        let doc = bson::Document::from_reader(&mut std::io::Cursor::new(bytes.clone())).unwrap();
+        assert_eq!(
+            doc.get("t").unwrap().element_type(),
+            bson::spec::ElementType::DateTime,
+            "date must serialize as a native BSON Date for the driver"
+        );
+        let back: DateWrap = bson::from_slice(&bytes).unwrap();
+        assert_eq!(back, w);
     }
 }
