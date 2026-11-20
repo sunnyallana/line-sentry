@@ -31,7 +31,12 @@ inflexible legacy systems.
 | **Guided setup** | A readiness checklist wires each machine's power + cycle signals in one step, and shows exactly what's left before metrics go live. |
 | **Live OEE / MTTR / MTBF** | Availability × performance × quality, computed per machine, department, and factory over any timeframe. |
 | **Real-time timeline** | Hour-by-hour production with operator/mold assignment and stoppage classification, streamed over Socket.IO. |
-| **Rust core** | Axum backend + Tokio edge daemon — memory-safe, fast, and integration-tested. |
+| **Loss analysis** | Stoppage time by reason, and the same figures by machine, shift, operator and mold, with the distribution of time between units. Exports to CSV. |
+| **Alerts with escalation** | Email and webhook when a machine stays stopped, and again to more people if it stays stopped longer. Each alert is sent once. |
+| **Wall-screen board** | A full-screen floor view that rotates through departments. |
+| **Your own stoppage reasons** | Define the reasons operators pick from and how each one counts. Planned stops do not count against availability. |
+| **No lost readings** | Unit counts are atomic and idempotent, state lives in the database, and the edge daemon replays an outage with the original timestamps. Runs as one instance or several. |
+| **Rust core** | Axum backend + Tokio edge daemon, with every query behind a persister layer and an integration suite that runs on MongoDB 7 and 8. |
 | **Secure by default** | JWT + bcrypt, mandatory CAPTCHA, rate limiting, API-key signal ingestion, RBAC. |
 
 ## Table of contents
@@ -151,6 +156,13 @@ cd daemon && BACKEND_URL=http://localhost:3001 DAEMON_API_KEY=<same> \
 
 Log in at **http://localhost:5173** with `admin` / `admin123`, then open **Setup**
 to register a PLC and wire your first machine's signals.
+
+Two helpers for local work, both against a running backend:
+
+```bash
+node scripts/dev-simulate.mjs   # adds molds and assignments, then posts signals every second
+node scripts/bench-ingest.mjs   # measures ingestion latency, throughput and units lost under load
+```
 
 ## Deployment (Docker Compose)
 
