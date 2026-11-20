@@ -3,61 +3,124 @@
 @tailwind utilities;
 
 @layer base {
-  /* Light theme tokens (HSL triplets — consumed by tailwind.config.js). */
+  /* Light theme tokens (HSL triplets — consumed by tailwind.config.js).
+     Neutral greys carry the layout; colour is kept for state and for the one
+     primary action. */
   :root {
-    --background: 210 40% 98%;
-    --foreground: 222 47% 11%;
+    --background: 220 14% 97%;
+    --foreground: 240 6% 10%;
     --card: 0 0% 100%;
-    --card-foreground: 222 47% 11%;
-    --muted: 210 40% 96%;
-    --muted-foreground: 215 16% 42%;
-    --border: 214 32% 88%;
-    --input: 214 32% 86%;
-    --ring: 217 91% 53%;
-    --primary: 217 91% 53%;
+    --card-foreground: 240 6% 10%;
+    --muted: 240 5% 93%;
+    --muted-foreground: 240 2% 40%;
+    --border: 220 9% 89%;
+    --input: 240 4% 80%;
+    --ring: 211 100% 45%;
+    --primary: 211 100% 45%;
     --primary-foreground: 0 0% 100%;
-    --accent: 210 40% 94%;
-    --accent-foreground: 222 47% 11%;
-    --destructive: 0 72% 48%;
+    --accent: 240 5% 92%;
+    --accent-foreground: 240 6% 10%;
+    --destructive: 354 100% 42%;
     --destructive-foreground: 0 0% 100%;
-    --success: 142 71% 38%;
-    --warning: 32 95% 44%;
-    --info: 199 89% 42%;
+    --success: 135 59% 32%;
+    --warning: 27 100% 35%;
+    --info: 199 100% 32%;
     --radius: 0.5rem;
+    --shadow-color: 240 6% 10%;
   }
 
   /* Dark theme (the app's default). */
   .dark {
-    --background: 222 47% 7%;
-    --foreground: 210 40% 96%;
-    --card: 222 41% 11%;
-    --card-foreground: 210 40% 96%;
-    --muted: 217 33% 16%;
-    --muted-foreground: 215 20% 65%;
-    --border: 217 30% 20%;
-    --input: 217 30% 22%;
-    --ring: 217 91% 60%;
-    --primary: 217 91% 60%;
-    --primary-foreground: 222 47% 8%;
-    --accent: 217 33% 18%;
-    --accent-foreground: 210 40% 96%;
-    --destructive: 0 72% 51%;
+    --background: 240 6% 4%;
+    --foreground: 240 5% 96%;
+    --card: 240 3% 11%;
+    --card-foreground: 240 5% 96%;
+    --muted: 240 3% 17%;
+    --muted-foreground: 240 4% 64%;
+    --border: 240 3% 19%;
+    --input: 240 3% 26%;
+    --ring: 210 100% 52%;
+    --primary: 210 100% 52%;
+    --primary-foreground: 0 0% 100%;
+    --accent: 240 3% 16%;
+    --accent-foreground: 240 5% 96%;
+    --destructive: 3 100% 61%;
     --destructive-foreground: 0 0% 100%;
-    --success: 142 69% 45%;
-    --warning: 38 92% 50%;
-    --info: 199 89% 48%;
+    --success: 135 64% 50%;
+    --warning: 36 100% 52%;
+    --info: 197 100% 68%;
+    --shadow-color: 0 0% 0%;
   }
 
   * {
     @apply border-border;
   }
+  html {
+    /* Colour-scheme drives native controls (scrollbars, date pickers). */
+    color-scheme: light;
+  }
+  html.dark {
+    color-scheme: dark;
+  }
   body {
     @apply bg-background text-foreground antialiased;
     font-feature-settings: 'rlig' 1, 'calt' 1;
+    font-optical-sizing: auto;
+    /* Eases the light/dark switch instead of flashing. */
+    transition: background-color 300ms ease, color 300ms ease;
+  }
+  /* Tracking is size-specific: large text tightens, body stays at 0. */
+  h1 {
+    letter-spacing: -0.022em;
+  }
+  h2 {
+    letter-spacing: -0.018em;
+  }
+  h3 {
+    letter-spacing: -0.012em;
+  }
+  /* Numbers that update live must not shift their neighbours. */
+  table,
+  dd,
+  .tabular {
+    font-variant-numeric: tabular-nums;
   }
   /* Keyboard focus ring for accessibility. */
   :focus-visible {
     @apply outline-none ring-2 ring-ring ring-offset-2 ring-offset-background;
+  }
+}
+
+@layer components {
+  /* Floating chrome (sidebar, top bar): content scrolls underneath. */
+  .material-chrome {
+    background-color: hsl(var(--card) / 0.72);
+    -webkit-backdrop-filter: saturate(180%) blur(20px);
+    backdrop-filter: saturate(180%) blur(20px);
+  }
+  /* Larger floating surfaces (dialogs) read as thicker. */
+  .material-sheet {
+    background-color: hsl(var(--card) / 0.94);
+    -webkit-backdrop-filter: saturate(180%) blur(28px);
+    backdrop-filter: saturate(180%) blur(28px);
+  }
+  /* One chevron for every select, instead of each browser's own arrow. */
+  .select-chevron {
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%238e8e93' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 0.7rem center;
+  }
+  /* Feedback on press, not on release. */
+  .pressable {
+    transition:
+      transform 120ms ease-out,
+      background-color 150ms ease-out,
+      border-color 150ms ease-out,
+      box-shadow 150ms ease-out,
+      color 150ms ease-out;
+  }
+  .pressable:active:not(:disabled) {
+    transform: scale(0.97);
   }
 }
 
@@ -74,5 +137,48 @@
   .scrollbar-thin::-webkit-scrollbar-thumb {
     background-color: hsl(var(--border));
     border-radius: 9999px;
+  }
+}
+
+/* Reduced motion keeps the feedback and drops the movement. */
+@media (prefers-reduced-motion: reduce) {
+  .pressable:active:not(:disabled) {
+    transform: none;
+  }
+  .animate-scale-in,
+  .animate-rise-in {
+    animation: fade-in 200ms ease both;
+  }
+  .animate-pulse,
+  .animate-bounce {
+    animation: none;
+  }
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  .material-chrome,
+  .material-sheet {
+    background-color: hsl(var(--card));
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+}
+
+@media (prefers-contrast: more) {
+  :root {
+    --border: 240 4% 55%;
+    --input: 240 4% 45%;
+    --muted-foreground: 240 4% 25%;
+  }
+  .dark {
+    --border: 240 4% 50%;
+    --input: 240 4% 60%;
+    --muted-foreground: 240 5% 82%;
+  }
+  .material-chrome,
+  .material-sheet {
+    background-color: hsl(var(--card));
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
   }
 }

@@ -4,11 +4,11 @@ import { cn } from '../../lib/cn';
 type BadgeVariant = 'default' | 'success' | 'warning' | 'danger' | 'info' | 'muted' | 'outline';
 
 const variants: Record<BadgeVariant, string> = {
-  default: 'bg-primary/15 text-primary',
-  success: 'bg-success/15 text-success',
-  warning: 'bg-warning/15 text-warning',
-  danger: 'bg-destructive/15 text-destructive',
-  info: 'bg-info/15 text-info',
+  default: 'bg-primary/10 text-primary',
+  success: 'bg-success/10 text-success',
+  warning: 'bg-warning/10 text-warning',
+  danger: 'bg-destructive/10 text-destructive',
+  info: 'bg-info/10 text-info',
   muted: 'bg-muted text-muted-foreground',
   outline: 'border border-border text-foreground',
 };
@@ -20,7 +20,7 @@ export interface BadgeProps extends React.HTMLAttributes<HTMLSpanElement> {
 export const Badge = ({ className, variant = 'default', ...props }: BadgeProps) => (
   <span
     className={cn(
-      'inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-xs font-medium',
+      'inline-flex items-center gap-1 whitespace-nowrap rounded-[5px] px-1.5 py-0.5 text-xs font-medium',
       variants[variant],
       className,
     )}

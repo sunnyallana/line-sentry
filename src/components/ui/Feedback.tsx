@@ -6,7 +6,7 @@ export const Spinner = ({ className }: { className?: string }) => (
     role="status"
     aria-label="Loading"
     className={cn(
-      'inline-block h-6 w-6 animate-spin rounded-full border-2 border-current border-t-transparent text-primary',
+      'inline-block h-6 w-6 animate-spin rounded-full border-2 border-current border-t-transparent text-muted-foreground',
       className,
     )}
   />
@@ -36,10 +36,10 @@ export const EmptyState = ({
   description?: string;
   action?: React.ReactNode;
 }) => (
-  <div className="flex flex-col items-center justify-center gap-2 rounded-lg border border-dashed border-border p-10 text-center">
+  <div className="flex flex-col items-center justify-center gap-1.5 px-6 py-12 text-center">
     {icon && <div className="text-muted-foreground">{icon}</div>}
     <h3 className="text-sm font-semibold text-foreground">{title}</h3>
-    {description && <p className="max-w-sm text-sm text-muted-foreground">{description}</p>}
-    {action && <div className="mt-2">{action}</div>}
+    {description && <p className="max-w-sm text-[13px] text-muted-foreground">{description}</p>}
+    {action && <div className="mt-3">{action}</div>}
   </div>
 );

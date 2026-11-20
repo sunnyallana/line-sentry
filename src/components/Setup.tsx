@@ -2,12 +2,12 @@ import React, { useState } from 'react';
 import { Link } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { toast } from 'react-toastify';
-import {
-  CheckCircle2, Circle, Zap, Activity, Plus, Trash2, ChevronDown, ChevronRight,
-  Package, ArrowRight, Cpu, Server,
-} from 'lucide-react';
+import { Check, ChevronDown, ChevronRight, Circle, Trash2 } from 'lucide-react';
 import apiService from '../services/api';
-import { Button, Input, Label, Select, Card, CardContent, CardHeader, CardTitle, Badge, PageLoader, EmptyState, Spinner } from './ui';
+import {
+  Button, DataTable, EmptyState, Field, IconButton, Input, PageHeader, PageLoader, Section, Select, Spinner,
+  type Column,
+} from './ui';
 import { cn } from '../lib/cn';
 
 interface SetupMachine {
@@ -23,7 +23,7 @@ interface SetupMachine {
 }
 interface Signal { sensorId: string; name: string; role: string; plcId: string | null; pinId: string | null }
 interface PinMapping { _id: string; plcId?: string; pinId: string }
-interface Plc { _id: string; plcId: string; name: string; ip?: string; rack: number; slot: number; byteCount: number }
+interface Plc { _id: string; plcId: string; name: string; ip?: string; rack: number; slot: number; byteCount: number; lastSeenAt?: string }
 
 const errMsg = (e: unknown, fallback: string) => (e instanceof Error ? e.message : fallback);
 
@@ -34,7 +34,29 @@ const pinsForPlc = (byteCount: number): string[] => {
   return out;
 };
 
-/* --------------------------------------------------------------- PLC registry */
+const STALE_AFTER_MIN = 5;
+
+const ago = (minutes: number) => {
+  if (minutes < 1) return 'just now';
+  if (minutes < 60) return `${minutes} min ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} h ago`;
+  const days = Math.floor(hours / 24);
+  return `${days} ${days === 1 ? 'day' : 'days'} ago`;
+};
+
+/** When a PLC last sent anything, and whether it has gone quiet. */
+const plcSignal = (lastSeenAt?: string): { text: string; stale: boolean } => {
+  const seen = lastSeenAt ? new Date(lastSeenAt).getTime() : NaN;
+  if (Number.isNaN(seen)) return { text: 'No signal yet', stale: false };
+  const minutes = Math.max(0, Math.floor((Date.now() - seen) / 60000));
+  return minutes > STALE_AFTER_MIN
+    ? { text: `Not sending. Last signal ${ago(minutes)}`, stale: true }
+    : { text: `Last signal ${ago(minutes)}`, stale: false };
+};
+
+const signalLabel = (role: string) =>
+  role === 'power' ? 'Power signal' : role === 'unit-cycle' ? 'Unit-cycle signal' : role.replace('-', ' ');
 
 const PlcRegistry: React.FC = () => {
   const queryClient = useQueryClient();
@@ -55,54 +77,101 @@ const PlcRegistry: React.FC = () => {
   });
 
   const plcs = plcsQ.data ?? [];
+  const quiet = plcs.filter((p) => plcSignal(p.lastSeenAt).stale).length;
+
+  const columns: Column<Plc>[] = [
+    { key: 'name', header: 'Name', render: (p) => {
+      const signal = plcSignal(p.lastSeenAt);
+      return (
+        <div className="min-w-0">
+          <p className="font-medium text-foreground">{p.name}</p>
+          <p className={cn('text-xs', signal.stale ? 'text-warning' : 'text-muted-foreground')}>{signal.text}</p>
+        </div>
+      );
+    } },
+    { key: 'plcId', header: 'ID', className: 'whitespace-nowrap font-mono text-[13px]', render: (p) => p.plcId },
+    { key: 'ip', header: 'Address', className: 'tabular whitespace-nowrap', render: (p) => p.ip || '–' },
+    { key: 'pins', header: 'Pins', className: 'tabular text-right', render: (p) => p.byteCount * 8 },
+    { key: 'actions', header: <span className="sr-only">Actions</span>, className: 'text-right', render: (p) => (
+      <div className="flex justify-end">
+        <IconButton label="Remove PLC" danger onClick={() => delMut.mutate(p._id)}>
+          <Trash2 className="h-4 w-4" />
+        </IconButton>
+      </div>
+    ) },
+  ];
 
   return (
-    <Card>
-      <CardHeader className="cursor-pointer" onClick={() => setOpen((o) => !o)}>
-        <CardTitle className="flex items-center justify-between">
-          <span className="flex items-center gap-2"><Server className="h-5 w-5 text-primary" /> PLCs <span className="text-sm font-normal text-muted-foreground">({plcs.length})</span></span>
-          {open ? <ChevronDown className="h-4 w-4 text-muted-foreground" /> : <ChevronRight className="h-4 w-4 text-muted-foreground" />}
-        </CardTitle>
-      </CardHeader>
-      {open && (
-        <CardContent className="space-y-4">
-          <p className="text-sm text-muted-foreground">
-            Each PLC exposes <span className="text-foreground">8 × bytes</span> output pins (Q0.0…). Add one entry per device, or a single
-            entry with more bytes for a head/gateway PLC that aggregates others.
-          </p>
+    <Section
+      flush
+      title="PLCs"
+      description="The controllers that send machine signals to LineSentry."
+      actions={
+        <Button variant="ghost" size="sm" aria-expanded={open} onClick={() => setOpen((o) => !o)}>
+          {open ? 'Hide' : 'Manage'}
+          {open ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
+        </Button>
+      }
+    >
+      {!open ? (
+        <p className="px-5 py-3 text-[13px] text-muted-foreground">
+          {plcs.length === 0 ? 'No PLCs yet. Add one before wiring signals.' : `${plcs.length} ${plcs.length === 1 ? 'PLC' : 'PLCs'} registered.`}
+          {quiet > 0 && <span className="text-warning"> {quiet} not sending.</span>}
+        </p>
+      ) : (
+        <>
+          {plcs.length === 0 ? (
+            <p className="px-5 py-6 text-[13px] text-muted-foreground">No PLCs yet. Add the first one below.</p>
+          ) : (
+            <DataTable columns={columns} rows={plcs} rowKey={(p) => p._id} />
+          )}
 
-          <div className="divide-y divide-border rounded-md border border-border">
-            {plcs.length === 0 ? (
-              <p className="p-4 text-center text-sm text-muted-foreground">No PLCs yet.</p>
-            ) : plcs.map((p) => (
-              <div key={p._id} className="flex items-center justify-between px-4 py-2">
-                <div className="flex items-center gap-3">
-                  <Badge variant="outline">{p.plcId}</Badge>
-                  <span className="text-foreground">{p.name}</span>
-                  <span className="text-xs text-muted-foreground">{p.ip ? `${p.ip} · ` : ''}{p.byteCount * 8} pins</span>
-                </div>
-                <Button variant="ghost" size="icon" aria-label="Remove PLC" onClick={() => delMut.mutate(p._id)}><Trash2 className="h-4 w-4 text-destructive" /></Button>
-              </div>
-            ))}
+          <div className="border-t border-border px-5 py-4">
+            <h3 className="text-[13px] font-semibold text-foreground">Add a PLC</h3>
+            <div className="mt-3 grid grid-cols-2 items-end gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,1.6fr)_minmax(0,1.2fr)_5.5rem_auto]">
+              <Field label="ID">
+                <Input placeholder="line-1" value={form.plcId} onChange={(e) => setForm({ ...form, plcId: e.target.value })} />
+              </Field>
+              <Field label="Name">
+                <Input placeholder="Injection line 1" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} />
+              </Field>
+              <Field label="IP address">
+                <Input placeholder="192.168.0.1" value={form.ip} onChange={(e) => setForm({ ...form, ip: e.target.value })} />
+              </Field>
+              <Field label="Bytes">
+                <Input type="number" min={1} value={form.byteCount} onChange={(e) => setForm({ ...form, byteCount: parseInt(e.target.value) || 1 })} />
+              </Field>
+              <Button
+                className="col-span-2 sm:col-span-1"
+                disabled={!form.plcId.trim() || !form.name.trim()}
+                loading={addMut.isPending}
+                onClick={() => addMut.mutate()}
+              >
+                Add PLC
+              </Button>
+            </div>
+            <p className="mt-3 text-xs text-muted-foreground">
+              Each byte gives 8 output pins (Q0.0 to Q0.7, then Q1.0 and so on). Add one entry per device, or one entry with
+              more bytes for a gateway PLC that collects signals from others. The data collector for each PLC must run with{' '}
+              <code className="rounded bg-muted px-1">PLC_ID</code> set to the ID above and{' '}
+              <code className="rounded bg-muted px-1">BYTE_COUNT</code> set to the same number of bytes.
+            </p>
           </div>
-
-          <div className="grid grid-cols-2 items-end gap-3 rounded-md bg-muted/40 p-3 sm:grid-cols-6">
-            <div><Label>PLC id</Label><Input placeholder="line-1" value={form.plcId} onChange={(e) => setForm({ ...form, plcId: e.target.value })} /></div>
-            <div className="sm:col-span-2"><Label>Name</Label><Input placeholder="Injection line 1" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /></div>
-            <div><Label>IP</Label><Input placeholder="192.168.0.1" value={form.ip} onChange={(e) => setForm({ ...form, ip: e.target.value })} /></div>
-            <div><Label>Bytes</Label><Input type="number" min={1} value={form.byteCount} onChange={(e) => setForm({ ...form, byteCount: parseInt(e.target.value) || 1 })} /></div>
-            <Button disabled={!form.plcId.trim() || !form.name.trim()} loading={addMut.isPending} onClick={() => addMut.mutate()}><Plus className="h-4 w-4" /> Add</Button>
-          </div>
-          <p className="text-xs text-muted-foreground">Run one daemon per PLC with <code className="rounded bg-muted px-1">PLC_ID</code> set to its id and <code className="rounded bg-muted px-1">BYTE_COUNT</code> matching the bytes above.</p>
-        </CardContent>
+        </>
       )}
-    </Card>
+    </Section>
   );
 };
 
-/* ----------------------------------------------------------- per-machine card */
+const Step: React.FC<{ done: boolean; label: string }> = ({ done, label }) => (
+  <span className={cn('inline-flex items-center gap-1.5 whitespace-nowrap text-xs', done ? 'text-foreground' : 'text-muted-foreground')}>
+    {done ? <Check className="h-3.5 w-3.5" aria-hidden /> : <Circle className="h-3.5 w-3.5 text-muted-foreground/60" aria-hidden />}
+    {label}
+    <span className="sr-only">{done ? ' (done)' : ' (not done)'}</span>
+  </span>
+);
 
-const MachineSetupCard: React.FC<{ machine: SetupMachine; plcs: Plc[] }> = ({ machine, plcs }) => {
+const MachineRow: React.FC<{ machine: SetupMachine; plcs: Plc[] }> = ({ machine, plcs }) => {
   const queryClient = useQueryClient();
   const [open, setOpen] = useState(!machine.ready);
   const [form, setForm] = useState({ plcId: plcs[0]?.plcId ?? '', role: 'power', pinId: '' });
@@ -134,94 +203,99 @@ const MachineSetupCard: React.FC<{ machine: SetupMachine; plcs: Plc[] }> = ({ ma
     onError: (e) => toast.error(errMsg(e, 'Could not remove signal')),
   });
 
-  const steps = [machine.powerMapped, machine.cycleMapped, machine.departmentHasMold].filter(Boolean).length;
+  const left = 3 - [machine.powerMapped, machine.cycleMapped, machine.departmentHasMold].filter(Boolean).length;
+  const signals = signalsQ.data ?? [];
+  const plcName = (id: string | null) => plcs.find((p) => p.plcId === (id ?? 'default'))?.name ?? id ?? 'default';
 
   return (
-    <Card>
-      <CardContent className="p-4">
-        <button className="flex w-full items-center justify-between gap-3 text-left" onClick={() => setOpen((o) => !o)}>
-          <div className="flex items-center gap-3">
-            {open ? <ChevronDown className="h-4 w-4 text-muted-foreground" /> : <ChevronRight className="h-4 w-4 text-muted-foreground" />}
-            <Cpu className="h-5 w-5 text-primary" />
-            <div>
-              <div className="font-medium text-foreground">{machine.name}</div>
-              <div className="text-xs text-muted-foreground">{machine.departmentName}</div>
-            </div>
+    <li>
+      <button
+        type="button"
+        aria-expanded={open}
+        className="flex w-full items-center gap-3 px-5 py-2.5 text-left transition-colors duration-150 hover:bg-foreground/[0.03] focus-visible:ring-inset"
+        onClick={() => setOpen((o) => !o)}
+      >
+        {open
+          ? <ChevronDown className="h-4 w-4 shrink-0 text-muted-foreground" aria-hidden />
+          : <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground" aria-hidden />}
+        <span className="min-w-0 flex-1 truncate text-sm font-medium text-foreground">{machine.name}</span>
+        <span className="hidden items-center gap-4 md:flex">
+          <Step done={machine.powerMapped} label="Power signal" />
+          <Step done={machine.cycleMapped} label="Unit-cycle signal" />
+          <Step done={machine.departmentHasMold} label="Mold" />
+        </span>
+        <span className={cn('w-24 shrink-0 text-right text-[13px]', machine.ready ? 'text-muted-foreground' : 'text-warning')}>
+          {machine.ready ? 'Ready' : `${left} ${left === 1 ? 'step' : 'steps'} left`}
+        </span>
+      </button>
+
+      {open && (
+        <div className="space-y-4 border-t border-border bg-muted/20 py-4 pl-12 pr-5">
+          <div className="flex flex-wrap gap-x-4 gap-y-1 md:hidden">
+            <Step done={machine.powerMapped} label="Power signal" />
+            <Step done={machine.cycleMapped} label="Unit-cycle signal" />
+            <Step done={machine.departmentHasMold} label="Mold" />
           </div>
-          {machine.ready ? <Badge variant="success">Ready</Badge> : <Badge variant="warning">{3 - steps} step{3 - steps === 1 ? '' : 's'} left</Badge>}
-        </button>
 
-        <div className="mt-4 grid grid-cols-1 gap-2 sm:grid-cols-3">
-          <Check ok={machine.powerMapped} label="Power signal wired" />
-          <Check ok={machine.cycleMapped} label="Cycle signal wired" />
-          <Check ok={machine.departmentHasMold} label="Mold defined">
-            <Link to="/molds" className="inline-flex items-center gap-1 text-xs text-primary hover:underline">Add <ArrowRight className="h-3 w-3" /></Link>
-          </Check>
-        </div>
-
-        {open && (
-          <div className="mt-4 space-y-3 border-t border-border pt-4">
-            <h4 className="text-sm font-medium text-foreground">Wired signals</h4>
-            {signalsQ.isLoading ? <Spinner /> : (signalsQ.data ?? []).length === 0 ? (
-              <p className="text-sm text-muted-foreground">No signals yet — wire a power and a cycle signal below.</p>
+          <div>
+            <h4 className="text-[13px] font-medium text-foreground">Wired signals</h4>
+            {signalsQ.isLoading ? (
+              <Spinner className="mt-2 h-4 w-4" />
+            ) : signals.length === 0 ? (
+              <p className="mt-1 text-[13px] text-muted-foreground">None yet. Wire a power signal and a unit-cycle signal below.</p>
             ) : (
-              <div className="divide-y divide-border rounded-md border border-border">
-                {(signalsQ.data ?? []).map((s) => (
-                  <div key={s.sensorId} className="flex items-center justify-between px-3 py-2">
-                    <div className="flex items-center gap-3">
-                      {s.role === 'power' ? <Zap className="h-4 w-4 text-warning" /> : <Activity className="h-4 w-4 text-info" />}
-                      <span className="text-sm capitalize text-foreground">{s.role.replace('-', ' ')}</span>
-                      {s.pinId ? <Badge variant="outline">{s.plcId ?? 'default'} · {s.pinId}</Badge> : <Badge variant="muted">no pin</Badge>}
-                    </div>
-                    <Button variant="ghost" size="icon" aria-label="Remove signal" onClick={() => delMut.mutate(s.sensorId)}><Trash2 className="h-4 w-4 text-destructive" /></Button>
-                  </div>
+              <ul className="mt-1 divide-y divide-border border-y border-border">
+                {signals.map((s) => (
+                  <li key={s.sensorId} className="flex items-center gap-3 py-1">
+                    <span className="w-36 shrink-0 text-[13px] text-foreground">{signalLabel(s.role)}</span>
+                    <span className="min-w-0 flex-1 truncate text-[13px] text-muted-foreground">
+                      {s.pinId ? <>{plcName(s.plcId)}, pin <span className="font-mono">{s.pinId}</span></> : 'No pin assigned'}
+                    </span>
+                    <IconButton label="Remove signal" danger onClick={() => delMut.mutate(s.sensorId)}>
+                      <Trash2 className="h-4 w-4" />
+                    </IconButton>
+                  </li>
                 ))}
-              </div>
-            )}
-
-            {plcs.length === 0 ? (
-              <p className="rounded-md bg-warning/10 p-3 text-sm text-warning">Add a PLC above before wiring signals.</p>
-            ) : (
-              <div className="flex flex-wrap items-end gap-3 rounded-md bg-muted/40 p-3">
-                <div>
-                  <Label>PLC</Label>
-                  <Select className="w-40" value={form.plcId} onChange={(e) => setForm({ ...form, plcId: e.target.value, pinId: '' })}>
-                    {plcs.map((p) => <option key={p._id} value={p.plcId}>{p.name}</option>)}
-                  </Select>
-                </div>
-                <div>
-                  <Label>Role</Label>
-                  <Select className="w-36" value={form.role} onChange={(e) => setForm({ ...form, role: e.target.value })}>
-                    <option value="power">Power</option>
-                    <option value="unit-cycle">Unit-cycle</option>
-                  </Select>
-                </div>
-                <div>
-                  <Label>Pin</Label>
-                  <Select className="w-28" value={form.pinId} onChange={(e) => setForm({ ...form, pinId: e.target.value })}>
-                    <option value="">Select…</option>
-                    {freePins.map((p) => <option key={p} value={p}>{p}</option>)}
-                  </Select>
-                </div>
-                <Button disabled={!form.pinId} loading={addMut.isPending} onClick={() => addMut.mutate()}><Plus className="h-4 w-4" /> Wire</Button>
-              </div>
+              </ul>
             )}
           </div>
-        )}
-      </CardContent>
-    </Card>
+
+          {plcs.length === 0 ? (
+            <p className="text-[13px] text-warning">Add a PLC above before wiring signals.</p>
+          ) : (
+            <div className="flex flex-wrap items-end gap-3">
+              <Field label="PLC" className="w-44">
+                <Select value={form.plcId} onChange={(e) => setForm({ ...form, plcId: e.target.value, pinId: '' })}>
+                  {plcs.map((p) => <option key={p._id} value={p.plcId}>{p.name}</option>)}
+                </Select>
+              </Field>
+              <Field label="Signal" className="w-40">
+                <Select value={form.role} onChange={(e) => setForm({ ...form, role: e.target.value })}>
+                  <option value="power">Power</option>
+                  <option value="unit-cycle">Unit cycle</option>
+                </Select>
+              </Field>
+              <Field label="Pin" className="w-32">
+                <Select value={form.pinId} onChange={(e) => setForm({ ...form, pinId: e.target.value })}>
+                  <option value="">Select a pin</option>
+                  {freePins.map((p) => <option key={p} value={p}>{p}</option>)}
+                </Select>
+              </Field>
+              <Button disabled={!form.pinId} loading={addMut.isPending} onClick={() => addMut.mutate()}>Wire</Button>
+            </div>
+          )}
+
+          {!machine.departmentHasMold && (
+            <p className="text-[13px] text-muted-foreground">
+              This department has no mold yet.{' '}
+              <Link to="/molds" className="font-medium text-foreground underline underline-offset-2">Add a mold</Link>
+            </p>
+          )}
+        </div>
+      )}
+    </li>
   );
 };
-
-const Check: React.FC<{ ok: boolean; label: string; children?: React.ReactNode }> = ({ ok, label, children }) => (
-  <div className="flex items-center gap-2 text-sm">
-    {ok ? <CheckCircle2 className="h-4 w-4 shrink-0 text-success" /> : <Circle className="h-4 w-4 shrink-0 text-muted-foreground" />}
-    <span className={ok ? 'text-foreground' : 'text-muted-foreground'}>{label}</span>
-    {!ok && children}
-  </div>
-);
-
-/* ------------------------------------------------------------------- page */
 
 const Setup: React.FC = () => {
   const statusQ = useQuery<SetupMachine[]>({ queryKey: ['setup-status'], queryFn: () => apiService.getSetupStatus() });
@@ -240,44 +314,62 @@ const Setup: React.FC = () => {
 
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-bold text-foreground">Setup</h1>
-        <p className="text-muted-foreground">Register your PLCs and wire each machine's signals so its OEE, MTTR &amp; MTBF go live.</p>
-      </div>
+      <PageHeader title="Setup" description="Connect each machine's two signals so it can be monitored." />
 
-      <Card>
-        <CardContent className="flex flex-wrap items-center gap-4 p-5">
-          <div className={cn('flex h-11 w-11 items-center justify-center rounded-lg', allReady ? 'bg-success/15 text-success' : 'bg-warning/15 text-warning')}>
-            {allReady ? <CheckCircle2 className="h-6 w-6" /> : <Activity className="h-6 w-6" />}
+      {machines.length > 0 && (
+        <Section>
+          <div className="flex flex-wrap items-baseline justify-between gap-x-6 gap-y-1">
+            <p className="text-sm font-medium text-foreground">
+              {allReady ? 'All machines are ready.' : `${ready} of ${machines.length} machines ready`}
+            </p>
+            <p className="text-xs text-muted-foreground">
+              A machine is ready when both signals are wired and its department has a mold.
+            </p>
           </div>
-          <div>
-            <div className="text-lg font-semibold text-foreground">{ready} of {machines.length} machines ready</div>
-            <div className="text-sm text-muted-foreground">Ready = power signal + cycle signal wired, and a mold defined in the department.</div>
+          <div
+            className="mt-3 h-1 w-full overflow-hidden rounded-full bg-muted"
+            role="progressbar"
+            aria-label="Machines ready"
+            aria-valuemin={0}
+            aria-valuemax={machines.length}
+            aria-valuenow={ready}
+          >
+            <div className="h-full rounded-full bg-foreground/70" style={{ width: `${(ready / machines.length) * 100}%` }} />
           </div>
-        </CardContent>
-      </Card>
+          <details className="mt-4 text-[13px] text-muted-foreground">
+            <summary className="w-fit cursor-pointer rounded text-foreground">How this works</summary>
+            <ul className="mt-2 list-disc space-y-1 pl-5">
+              <li>The power signal shows when the machine is switched on. It gives availability and running time.</li>
+              <li>The unit-cycle signal counts each unit the machine produces. It gives output and quality.</li>
+              <li>
+                A mold assigned on the timeline sets the expected rate. It gives performance, which completes OEE
+                (overall equipment effectiveness).
+              </li>
+            </ul>
+          </details>
+        </Section>
+      )}
 
       <PlcRegistry />
 
-      <div className="rounded-lg border border-info/30 bg-info/10 p-4 text-sm text-foreground">
-        <p className="mb-1 flex items-center gap-2 font-medium"><Package className="h-4 w-4 text-info" /> How metrics come alive</p>
-        <ol className="ml-6 list-decimal space-y-0.5 text-muted-foreground">
-          <li><span className="text-foreground">Power signal</span> → when the machine is on (availability &amp; running time).</li>
-          <li><span className="text-foreground">Cycle signal</span> → counts produced units (quality &amp; throughput).</li>
-          <li><span className="text-foreground">A mold</span> assigned on the timeline → ideal rate (performance, completing OEE).</li>
-        </ol>
-      </div>
-
-      {machines.length === 0 ? (
-        <EmptyState icon={<Cpu className="h-8 w-8" />} title="No machines yet" description="Create a department and add machines, then return here to wire their signals." action={<Link to="/departments"><Button>Go to Departments</Button></Link>} />
-      ) : (
-        Object.entries(byDept).map(([dept, list]) => (
-          <div key={dept} className="space-y-3">
-            <h2 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">{dept}</h2>
-            {list.map((m) => <MachineSetupCard key={m.machineId} machine={m} plcs={plcs} />)}
-          </div>
-        ))
-      )}
+      <Section flush title="Machines" description="Select a machine to wire its signals.">
+        {machines.length === 0 ? (
+          <EmptyState
+            title="No machines yet"
+            description="Create a department and add machines, then return here to wire their signals."
+            action={<Link to="/departments"><Button>Go to departments</Button></Link>}
+          />
+        ) : (
+          Object.entries(byDept).map(([dept, list]) => (
+            <div key={dept} className="border-b border-border last:border-b-0">
+              <h3 className="border-b border-border bg-muted/40 px-5 py-1.5 text-xs font-medium text-muted-foreground">{dept}</h3>
+              <ul className="divide-y divide-border">
+                {list.map((m) => <MachineRow key={m.machineId} machine={m} plcs={plcs} />)}
+              </ul>
+            </div>
+          ))
+        )}
+      </Section>
     </div>
   );
 };

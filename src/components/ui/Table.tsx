@@ -27,12 +27,12 @@ export function DataTable<T>({
   empty?: React.ReactNode;
 }) {
   return (
-    <div className="scrollbar-thin overflow-x-auto rounded-lg border border-border">
+    <div className="scrollbar-thin overflow-x-auto">
       <table className="w-full text-sm">
-        <thead className="bg-muted/50 text-left text-xs uppercase tracking-wide text-muted-foreground">
+        <thead className="border-b border-border bg-muted/40 text-left text-xs text-muted-foreground">
           <tr>
             {columns.map((c) => (
-              <th key={c.key} className={cn('px-4 py-3 font-medium', c.className)}>
+              <th key={c.key} scope="col" className={cn('whitespace-nowrap px-5 py-2 font-medium', c.className)}>
                 {c.sortable && onSort ? (
                   <button
                     type="button"
@@ -52,7 +52,7 @@ export function DataTable<T>({
         <tbody className="divide-y divide-border">
           {rows.length === 0 ? (
             <tr>
-              <td colSpan={columns.length} className="px-4 py-10 text-center text-muted-foreground">
+              <td colSpan={columns.length} className={cn('text-center text-sm text-muted-foreground', (!empty || typeof empty === 'string') && 'px-5 py-12')}>
                 {empty ?? 'No results'}
               </td>
             </tr>
@@ -61,10 +61,10 @@ export function DataTable<T>({
               <tr
                 key={rowKey(row)}
                 onClick={onRowClick ? () => onRowClick(row) : undefined}
-                className={cn('transition-colors hover:bg-accent/50', onRowClick && 'cursor-pointer')}
+                className={cn('transition-colors duration-150', onRowClick && 'cursor-pointer hover:bg-foreground/[0.04] active:bg-foreground/[0.07]')}
               >
                 {columns.map((c) => (
-                  <td key={c.key} className={cn('px-4 py-3 text-foreground', c.className)}>
+                  <td key={c.key} className={cn('px-5 py-2.5 text-foreground', c.className)}>
                     {c.render(row)}
                   </td>
                 ))}
@@ -88,13 +88,13 @@ export function Pagination({
 }) {
   if (!totalPages || totalPages <= 1) return null;
   return (
-    <div className="flex items-center justify-between pt-4">
-      <p className="text-sm text-muted-foreground">
+    <div className="flex items-center justify-between border-t border-border px-5 py-3">
+      <p className="text-[13px] text-muted-foreground">
         Page {page} of {totalPages}
       </p>
       <div className="flex gap-2">
         <Button variant="outline" size="sm" disabled={page <= 1} onClick={() => onPage(page - 1)}>
-          <ChevronLeft className="h-4 w-4" /> Prev
+          <ChevronLeft className="h-4 w-4" /> Previous
         </Button>
         <Button variant="outline" size="sm" disabled={page >= totalPages} onClick={() => onPage(page + 1)}>
           Next <ChevronRight className="h-4 w-4" />

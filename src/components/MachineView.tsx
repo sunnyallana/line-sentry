@@ -3,41 +3,65 @@ import { useParams, useNavigate } from 'react-router-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { toast } from 'react-toastify';
 import { format, startOfYear, startOfMonth, startOfWeek, startOfDay } from 'date-fns';
-import { ArrowLeft, Activity, AlertTriangle, Clock, Gauge, Zap, ZapOff, Edit, Info, Calendar, Check } from 'lucide-react';
+import { Pencil } from 'lucide-react';
 import { Machine, MachineStats, MachineStatus } from '../types';
 import apiService from '../services/api';
 import socketService from '../services/socket';
+import { useAuth } from '../context/auth-context';
 import { useSocketEvent } from '../hooks/useSocketEvent';
 import ProductionTimeline from './ProductionTimeline';
-import { Button, Input, Label, Card, CardContent, PageLoader, Spinner } from './ui';
-import { cn } from '../lib/cn';
+import {
+  Button, EmptyState, Field, Input, Modal, PageHeader, PageLoader, Section, Segmented, Spinner, Stat, StatStrip,
+  StatusDot, formatNumber,
+} from './ui';
 
 type Period = 'today' | 'week' | 'month' | 'year' | 'custom';
 const PERIODS: { value: Period; label: string }[] = [
   { value: 'today', label: 'Today' },
-  { value: 'week', label: 'This Week' },
-  { value: 'month', label: 'Month to Date' },
-  { value: 'year', label: 'Year to Date' },
-  { value: 'custom', label: 'Custom Range' },
+  { value: 'week', label: 'This week' },
+  { value: 'month', label: 'This month' },
+  { value: 'year', label: 'This year' },
+  { value: 'custom', label: 'Custom' },
 ];
 const fmt = (d: Date) => format(d, 'yyyy-MM-dd');
 const errMsg = (e: unknown, fallback: string) => (e instanceof Error ? e.message : fallback);
 
-const statusStyle = (s?: string) =>
-  s === 'running' ? 'text-success bg-success/10 border-success/20'
-    : s === 'stoppage' ? 'text-destructive bg-destructive/10 border-destructive/20 animate-pulse'
-    : s === 'stopped_yet_producing' ? 'text-warning bg-warning/10 border-warning/20'
-    : 'text-muted-foreground bg-muted border-border';
-const statusIcon = (s?: string) =>
-  s === 'running' ? <Zap className="h-4 w-4" /> : s === 'stoppage' ? <AlertTriangle className="h-4 w-4" /> : s === 'stopped_yet_producing' ? <ZapOff className="h-4 w-4" /> : <Activity className="h-4 w-4" />;
+/** Minutes as "3 h 20 min", "45 min" or "2.5 days". */
+const duration = (minutes: number | undefined) => {
+  if (!minutes || minutes <= 0) return '–';
+  if (minutes >= 2880) return `${(minutes / 1440).toFixed(1)} days`;
+  if (minutes >= 60) return `${Math.floor(minutes / 60)} h ${Math.round(minutes % 60)} min`;
+  return `${Math.round(minutes)} min`;
+};
 
-const MetricBar: React.FC<{ label: string; value: number; barClass: string; title: string }> = ({ label, value, barClass, title }) => (
-  <div className="flex items-center justify-between" title={title}>
-    <span className="flex items-center gap-1 text-muted-foreground">{label}<Info className="h-3 w-3" /></span>
-    <div className="flex items-center gap-2">
-      <div className="h-2 w-20 rounded-full bg-muted"><div className={cn('h-2 rounded-full', barClass)} style={{ width: `${value}%` }} /></div>
-      <span className="font-medium text-foreground">{value}%</span>
+/* One OEE factor: what it is in plain words, its value, and a bar to compare
+   the three at a glance. The bar is neutral; the lowest factor is the one to
+   work on and is the only one marked. */
+const Factor = ({ name, meaning, value, lowest }: { name: string; meaning: string; value: number; lowest: boolean }) => (
+  <div>
+    <div className="flex items-baseline justify-between gap-4">
+      <div className="min-w-0">
+        <p className="text-sm font-medium text-foreground">
+          {name}
+          {lowest && <span className="ml-2 text-xs font-normal text-warning">Lowest</span>}
+        </p>
+        <p className="text-xs text-muted-foreground">{meaning}</p>
+      </div>
+      <p className="tabular shrink-0 text-sm font-semibold text-foreground">{value}%</p>
     </div>
+    <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-muted" aria-hidden>
+      <div
+        className={lowest ? 'h-full rounded-full bg-warning' : 'h-full rounded-full bg-foreground/70'}
+        style={{ width: `${Math.max(0, Math.min(100, value))}%` }}
+      />
+    </div>
+  </div>
+);
+
+const Row = ({ label, value }: { label: string; value: React.ReactNode }) => (
+  <div className="flex items-baseline justify-between gap-4 py-2">
+    <dt className="text-[13px] text-muted-foreground">{label}</dt>
+    <dd className="text-sm font-medium text-foreground">{value}</dd>
   </div>
 );
 
@@ -45,6 +69,7 @@ const MachineView: React.FC = () => {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
+  const { isAdmin } = useAuth();
 
   const [selectedPeriod, setSelectedPeriod] = useState<Period>('today');
   const [customStartDate, setCustomStartDate] = useState('');
@@ -64,7 +89,6 @@ const MachineView: React.FC = () => {
       default: return { startDate: fmt(startOfDay(now)), endDate: fmt(now) };
     }
   };
-  const ytdRange = () => { const now = new Date(); return { startDate: fmt(startOfYear(now)), endDate: fmt(now) }; };
 
   const machineQ = useQuery<Machine>({ queryKey: ['machine', id], queryFn: () => apiService.getMachine(id!), enabled: !!id });
   const statsQ = useQuery<MachineStats>({
@@ -72,11 +96,9 @@ const MachineView: React.FC = () => {
     queryFn: () => apiService.getMachineStats(id!, range()),
     enabled: !!id && (selectedPeriod !== 'custom' || (!!appliedCustomDates.start && !!appliedCustomDates.end)),
   });
-  const ytdQ = useQuery<MachineStats>({ queryKey: ['machine-stats-ytd', id], queryFn: () => apiService.getMachineStats(id!, ytdRange()), enabled: !!id });
 
   const machine = machineQ.data ?? null;
   const stats = statsQ.data ?? null;
-  const ytdStats = ytdQ.data ?? null;
 
   // Seed edit form + live status from the fetched machine
   useEffect(() => {
@@ -96,7 +118,6 @@ const MachineView: React.FC = () => {
 
   const refresh = () => {
     queryClient.invalidateQueries({ queryKey: ['machine-stats', id] });
-    queryClient.invalidateQueries({ queryKey: ['machine-stats-ytd', id] });
   };
   const forMachine = (cb: () => void) => (u: { machineId: string }) => { if (u.machineId === id) cb(); };
 
@@ -111,8 +132,8 @@ const MachineView: React.FC = () => {
   });
 
   const handleApplyCustomDates = () => {
-    if (!customStartDate || !customEndDate) return toast.error('Please select both start and end dates');
-    if (customStartDate > customEndDate) return toast.error('Start date must be before end date');
+    if (!customStartDate || !customEndDate) return toast.error('Choose a start date and an end date');
+    if (customStartDate > customEndDate) return toast.error('The start date must be on or before the end date');
     setAppliedCustomDates({ start: customStartDate, end: customEndDate });
   };
   const hasUnappliedChanges = selectedPeriod === 'custom'
@@ -125,7 +146,7 @@ const MachineView: React.FC = () => {
       await apiService.updateMachine(id, editForm);
       queryClient.invalidateQueries({ queryKey: ['machine', id] });
       setIsEditing(false);
-      toast.success('Machine details updated');
+      toast.success('Machine details saved');
     } catch (err) {
       toast.error(errMsg(err, 'Failed to update machine'));
     }
@@ -134,7 +155,7 @@ const MachineView: React.FC = () => {
   const handleAddStoppage = async (stoppage: Record<string, unknown>) => {
     try {
       await apiService.addStoppageRecord({ ...stoppage, machineId: id });
-      toast.success('Stoppage recorded successfully');
+      toast.success('Stoppage recorded');
       refresh();
     } catch (err) {
       toast.error(errMsg(err, 'Failed to record stoppage'));
@@ -143,7 +164,7 @@ const MachineView: React.FC = () => {
   const handleUpdateProduction = async (machineId: string, hour: number, date: string, data: Record<string, unknown>) => {
     try {
       await apiService.updateProductionAssignment({ machineId, hour, date, ...data });
-      toast.success('Production data updated');
+      toast.success('Saved');
       refresh();
     } catch (err) {
       toast.error(errMsg(err, 'Failed to update production data'));
@@ -151,174 +172,143 @@ const MachineView: React.FC = () => {
   };
 
   if (machineQ.isLoading) return <PageLoader label="Loading machine…" />;
-  if (!machine) return <div className="py-12 text-center text-muted-foreground">Machine not found</div>;
+  if (!machine) {
+    return (
+      <EmptyState
+        title="Machine not found"
+        description="It may have been removed."
+        action={<Button variant="outline" onClick={() => navigate('/dashboard')}>Back to overview</Button>}
+      />
+    );
+  }
 
   const displayStatus = machineStatus || machine.status;
   const needDates = selectedPeriod === 'custom' && (!appliedCustomDates.start || !appliedCustomDates.end);
-  const mtbfDays = ytdStats && ytdStats.mtbf > 0 ? (ytdStats.mtbf / 1440).toFixed(1) : 0;
-  const defectRate = stats && stats.totalUnitsProduced > 0 ? ((stats.totalDefectiveUnits / stats.totalUnitsProduced) * 100).toFixed(1) : 0;
+  const periodLabel = PERIODS.find((p) => p.value === selectedPeriod)?.label.toLowerCase() ?? '';
+  const good = stats ? stats.totalUnitsProduced - stats.totalDefectiveUnits : 0;
+  const defectRate = stats && stats.totalUnitsProduced > 0 ? ((stats.totalDefectiveUnits / stats.totalUnitsProduced) * 100).toFixed(1) : '0.0';
+  const factors = stats
+    ? [
+        { name: 'Availability', meaning: 'Share of the time the machine was running, not stopped.', value: stats.availability },
+        { name: 'Performance', meaning: 'Units made compared with what the mold should make in that time.', value: stats.performance },
+        { name: 'Quality', meaning: 'Share of units that were good, not defective.', value: stats.quality },
+      ]
+    : [];
+  const lowest = factors.length && stats && stats.oee < 100 ? Math.min(...factors.map((f) => f.value)) : null;
+  // The hour-by-hour view follows the period chosen at the top of the page.
+  const timelinePeriod =
+    selectedPeriod === 'year'
+      ? { timeframe: 'custom' as const, start: fmt(startOfYear(new Date())), end: fmt(new Date()) }
+      : selectedPeriod === 'custom'
+        ? { timeframe: 'custom' as const, start: appliedCustomDates.start, end: appliedCustomDates.end }
+        : { timeframe: selectedPeriod };
+  const deptId = typeof machine.departmentId === 'string' ? machine.departmentId : (machine.departmentId as { _id?: string } | undefined)?._id;
 
   return (
     <div className="space-y-6">
-      {/* Header */}
-      <div className="flex items-center justify-between gap-4">
-        <div className="flex flex-1 items-center gap-4">
-          <Button variant="ghost" size="icon" aria-label="Back" onClick={() => navigate(-1)}><ArrowLeft className="h-5 w-5" /></Button>
-          {isEditing ? (
-            <div className="flex-1 space-y-2">
-              <Input value={editForm.name} onChange={(e) => setEditForm({ ...editForm, name: e.target.value })} className="text-lg font-bold" />
-              <Input value={editForm.description} onChange={(e) => setEditForm({ ...editForm, description: e.target.value })} placeholder="Description" />
-            </div>
-          ) : (
-            <div>
-              <h1 className="text-2xl font-bold text-foreground">{machine.name}</h1>
-              <p className="text-muted-foreground">{machine.description}</p>
-            </div>
-          )}
-        </div>
-        <div className="flex items-center gap-3">
-          <div className={cn('flex items-center gap-2 rounded-md border px-3 py-2', statusStyle(displayStatus))}>
-            {statusIcon(displayStatus)}
-            <span className="font-medium capitalize">{displayStatus.replace(/_/g, ' ')}</span>
-          </div>
-          {isEditing ? (
-            <div className="flex gap-2">
-              <Button variant="outline" onClick={() => setIsEditing(false)}>Cancel</Button>
-              <Button onClick={handleSaveEdit}>Save</Button>
-            </div>
-          ) : (
-            <Button variant="ghost" size="icon" aria-label="Edit machine" onClick={() => setIsEditing(true)}><Edit className="h-5 w-5" /></Button>
-          )}
-        </div>
-      </div>
+      <PageHeader
+        title={machine.name}
+        description={machine.description}
+        meta={<StatusDot status={displayStatus} />}
+        onBack={() => (deptId ? navigate(`/department/${deptId}`) : navigate(-1))}
+        backLabel="Back to department"
+        actions={
+          isAdmin ? (
+            <Button variant="outline" onClick={() => setIsEditing(true)}><Pencil className="h-4 w-4" /> Edit details</Button>
+          ) : undefined
+        }
+      />
 
-      {/* YTD key metrics */}
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
-        <Card><CardContent className="flex items-center gap-3 p-4" title="Overall Equipment Effectiveness (Year to Date)">
-          <Gauge className="h-6 w-6 text-warning" />
-          <div><p className="flex items-center gap-1 text-xs text-muted-foreground">OEE (YTD)<Info className="h-3 w-3" /></p><p className="text-lg font-semibold text-warning">{ytdStats?.oee ?? '—'}%</p></div>
-        </CardContent></Card>
-        <Card><CardContent className="flex items-center gap-3 p-4" title="Mean Time Between Failures in days (Year to Date)">
-          <Clock className="h-6 w-6 text-info" />
-          <div><p className="flex items-center gap-1 text-xs text-muted-foreground">MTBF (YTD)<Info className="h-3 w-3" /></p><p className="text-lg font-semibold text-info">{mtbfDays} days</p></div>
-        </CardContent></Card>
-        <Card><CardContent className="flex items-center gap-3 p-4" title="Mean Time To Repair in minutes (Year to Date)">
-          <Activity className="h-6 w-6 text-primary" />
-          <div><p className="flex items-center gap-1 text-xs text-muted-foreground">MTTR (YTD)<Info className="h-3 w-3" /></p><p className="text-lg font-semibold text-primary">{ytdStats?.mttr ?? '—'} min</p></div>
-        </CardContent></Card>
-      </div>
-
-      {/* Period selector */}
-      <div className="space-y-4">
-        <div className="flex flex-col gap-2 md:flex-row md:items-center md:gap-4">
-          <span className="text-sm font-medium text-muted-foreground">View Analytics For:</span>
-          <div className="flex flex-wrap gap-2">
-            {PERIODS.map((p) => (
-              <Button key={p.value} size="sm" variant={selectedPeriod === p.value ? 'primary' : 'outline'} onClick={() => setSelectedPeriod(p.value)}>
-                {p.value === 'custom' && <Calendar className="h-4 w-4" />} {p.label}
-              </Button>
-            ))}
-          </div>
-        </div>
-
+      <div className="flex flex-wrap items-center gap-3">
+        <Segmented<Period> ariaLabel="Period" value={selectedPeriod} onChange={setSelectedPeriod} options={PERIODS} />
         {selectedPeriod === 'custom' && (
-          <Card className="border-dashed">
-            <CardContent className="space-y-4 p-6">
-              <div className="flex items-center gap-3"><Calendar className="h-5 w-5 text-primary" /><h3 className="text-lg font-semibold text-foreground">Custom Date Range</h3></div>
-              <div className="grid grid-cols-1 items-end gap-4 md:grid-cols-3">
-                <div><Label>Start date</Label><Input type="date" value={customStartDate} onChange={(e) => setCustomStartDate(e.target.value)} /></div>
-                <div><Label>End date</Label><Input type="date" value={customEndDate} onChange={(e) => setCustomEndDate(e.target.value)} /></div>
-                <Button onClick={handleApplyCustomDates} disabled={!customStartDate || !customEndDate} className={cn(hasUnappliedChanges && 'animate-pulse')}>
-                  <Check className="h-4 w-4" /> {hasUnappliedChanges ? 'Apply Changes' : 'Applied'}
-                </Button>
-              </div>
-              {customStartDate && customEndDate && (
-                <p className="rounded-md bg-muted p-3 text-sm text-muted-foreground">
-                  Selected range: <span className="font-medium text-foreground">{new Date(customStartDate).toLocaleDateString()} – {new Date(customEndDate).toLocaleDateString()}</span>
-                  {appliedCustomDates.start && (customStartDate === appliedCustomDates.start && customEndDate === appliedCustomDates.end
-                    ? <span className="ml-2 text-success">✓ Applied</span>
-                    : <span className="ml-2 text-warning">⚠ Click Apply to update</span>)}
-                </p>
-              )}
-            </CardContent>
-          </Card>
+          <form
+            className="flex flex-wrap items-center gap-2"
+            onSubmit={(e) => { e.preventDefault(); handleApplyCustomDates(); }}
+          >
+            <Input type="date" aria-label="Start date" className="w-40" value={customStartDate} max={customEndDate || undefined} onChange={(e) => setCustomStartDate(e.target.value)} />
+            <span className="text-[13px] text-muted-foreground">to</span>
+            <Input type="date" aria-label="End date" className="w-40" value={customEndDate} min={customStartDate || undefined} onChange={(e) => setCustomEndDate(e.target.value)} />
+            <Button type="submit" variant={hasUnappliedChanges ? 'primary' : 'outline'} disabled={!customStartDate || !customEndDate || (!hasUnappliedChanges && !!appliedCustomDates.start)}>
+              {hasUnappliedChanges || !appliedCustomDates.start ? 'Show' : 'Showing'}
+            </Button>
+          </form>
         )}
       </div>
 
-      {/* Detailed metrics — header/selector above always stay visible */}
       {statsQ.isLoading ? (
-        <div className="py-10 text-center"><Spinner className="mx-auto" /><p className="mt-2 text-muted-foreground">Loading metrics…</p></div>
+        <div className="flex items-center justify-center gap-3 py-16 text-[13px] text-muted-foreground"><Spinner className="h-4 w-4" /> Loading figures…</div>
       ) : needDates ? (
-        <div className="rounded-lg border border-dashed border-border py-10 text-center">
-          <Calendar className="mx-auto mb-2 h-8 w-8 text-muted-foreground" />
-          <p className="text-muted-foreground">Pick a start and end date above, then click <span className="font-medium text-foreground">Apply</span>.</p>
-        </div>
+        <Section><p className="text-[13px] text-muted-foreground">Choose a start date and an end date, then select Show.</p></Section>
       ) : !stats ? (
-        <div className="py-10 text-center text-muted-foreground">No metrics for this period.</div>
+        <Section><p className="text-[13px] text-muted-foreground">No production was recorded for {periodLabel}.</p></Section>
       ) : (
-      <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
-        <Card><CardContent className="p-6">
-          <h3 className="mb-4 text-lg font-semibold text-foreground">Performance Metrics</h3>
-          <div className="space-y-4">
-            <MetricBar label="OEE" value={stats.oee} barClass="bg-primary" title="Availability × Performance × Quality" />
-            <MetricBar label="Availability" value={stats.availability} barClass="bg-success" title="Percentage of time the machine was available for production" />
-            <MetricBar label="Performance" value={stats.performance} barClass="bg-warning" title="Actual production rate vs. maximum possible rate" />
-            <MetricBar label="Quality" value={stats.quality} barClass="bg-info" title="Percentage of units meeting quality standards" />
-          </div>
-        </CardContent></Card>
+        <>
+          <StatStrip>
+            <Stat label="OEE" value={stats.oee} unit="%" hint="Availability × Performance × Quality" />
+            <Stat label="Units made" value={formatNumber(stats.totalUnitsProduced)} hint={`${formatNumber(good)} good`} />
+            <Stat label="Running time" value={duration(stats.totalRunningMinutes)} />
+            <Stat
+              label="Defects"
+              value={formatNumber(stats.totalDefectiveUnits)}
+              hint={`${defectRate}% of units`}
+              tone={stats.totalDefectiveUnits > 0 ? 'warn' : 'neutral'}
+            />
+          </StatStrip>
 
-        <Card><CardContent className="p-6">
-          <h3 className="mb-4 text-lg font-semibold text-foreground">Quality Metrics</h3>
-          <div className="space-y-4">
-            <div className="flex items-center justify-between" title="Units that passed quality inspection">
-              <span className="flex items-center gap-1 text-muted-foreground">Good Units<Info className="h-3 w-3" /></span>
-              <span className="font-medium text-success">{stats.totalUnitsProduced - stats.totalDefectiveUnits}</span>
-            </div>
-            <div className="flex items-center justify-between" title="Units that failed quality inspection">
-              <span className="flex items-center gap-1 text-muted-foreground">Defective Units<Info className="h-3 w-3" /></span>
-              <span className="font-medium text-destructive">{stats.totalDefectiveUnits}</span>
-            </div>
-            <div className="flex items-center justify-between" title="Percentage of units that were defective">
-              <span className="flex items-center gap-1 text-muted-foreground">Defect Rate<Info className="h-3 w-3" /></span>
-              <span className="font-medium text-warning">{defectRate}%</span>
-            </div>
-          </div>
-        </CardContent></Card>
+          <div className="grid grid-cols-1 gap-6 lg:grid-cols-5">
+            <Section title="What makes up OEE" description="The lowest of the three is where time or output is being lost." className="lg:col-span-3">
+              <div className="space-y-5">
+                {factors.map((f) => (
+                  <Factor key={f.name} {...f} lowest={lowest != null && f.value === lowest && f.value < 100} />
+                ))}
+              </div>
+            </Section>
 
-        <Card><CardContent className="p-6">
-          <h3 className="mb-4 text-lg font-semibold text-foreground">Reliability</h3>
-          <div className="space-y-4">
-            <div className="flex items-center justify-between" title="Current operational status of the machine">
-              <span className="flex items-center gap-1 text-muted-foreground">Current Status<Info className="h-3 w-3" /></span>
-              <span className={cn('font-medium capitalize', statusStyle(machine.status).split(' ')[0])}>{machine.status.replace(/_/g, ' ')}</span>
-            </div>
-            <div className="flex items-center justify-between" title="Mean Time Between Failures (selected period)">
-              <span className="flex items-center gap-1 text-muted-foreground">MTBF<Info className="h-3 w-3" /></span>
-              <span className="font-medium text-info">{stats.mtbf > 0 ? (stats.mtbf / 1440).toFixed(1) : 0} days</span>
-            </div>
-            <div className="flex items-center justify-between" title="Mean Time To Repair (selected period)">
-              <span className="flex items-center gap-1 text-muted-foreground">MTTR<Info className="h-3 w-3" /></span>
-              <span className="font-medium text-primary">{stats.mttr} minutes</span>
-            </div>
-            <div className="flex items-center justify-between" title="Total running time in the selected period">
-              <span className="flex items-center gap-1 text-muted-foreground">Running Time<Info className="h-3 w-3" /></span>
-              <span className="font-medium text-success">{Math.round((stats.totalRunningMinutes || 0) / 60 * 10) / 10}h</span>
-            </div>
+            <Section title="Reliability" className="lg:col-span-2">
+              <dl className="-my-2 divide-y divide-border">
+                <Row label="Average time between breakdowns" value={duration(stats.mtbf)} />
+                <Row label="Average time to repair" value={duration(stats.mttr)} />
+                <Row label="Running time" value={duration(stats.totalRunningMinutes)} />
+                <Row label="Good units" value={formatNumber(good)} />
+              </dl>
+              <p className="mt-4 text-xs text-muted-foreground">
+                Breakdown figures count stoppages classified as a breakdown.
+              </p>
+            </Section>
           </div>
-        </CardContent></Card>
-      </div>
+        </>
       )}
 
-      {/* Production timeline */}
-      <Card>
-        <div className="border-b border-border p-6">
-          <h2 className="text-lg font-semibold text-foreground">Real-time Production Timeline</h2>
-          <p className="mt-1 text-sm text-muted-foreground">Live production data with operator and mold information</p>
-        </div>
-        <div className="p-6">
-          <ProductionTimeline machineId={id!} onAddStoppage={handleAddStoppage} onUpdateProduction={handleUpdateProduction} />
-        </div>
-      </Card>
+      <Section title="Hour by hour" description="Units, stoppages, operator and mold for each hour. Select an hour to record or classify.">
+        <ProductionTimeline
+          machineId={id!}
+          onAddStoppage={handleAddStoppage}
+          onUpdateProduction={handleUpdateProduction}
+          period={timelinePeriod}
+        />
+      </Section>
+
+      <Modal
+        open={isEditing}
+        onClose={() => setIsEditing(false)}
+        title="Edit machine details"
+        footer={
+          <>
+            <Button variant="outline" onClick={() => setIsEditing(false)}>Cancel</Button>
+            <Button onClick={handleSaveEdit} disabled={!editForm.name.trim()}>Save</Button>
+          </>
+        }
+      >
+        <form className="space-y-4" onSubmit={(e) => { e.preventDefault(); if (editForm.name.trim()) handleSaveEdit(); }}>
+          <Field label="Name">
+            <Input value={editForm.name} onChange={(e) => setEditForm({ ...editForm, name: e.target.value })} />
+          </Field>
+          <Field label="Description" hint="Optional. Shown under the name.">
+            <Input value={editForm.description} onChange={(e) => setEditForm({ ...editForm, description: e.target.value })} />
+          </Field>
+        </form>
+      </Modal>
     </div>
   );
 };

@@ -317,6 +317,16 @@ class ApiService {
     return this.request('/config/shifts');
   }
 
+  /** The newest alerts that were raised. */
+  async getAlerts(limit = 20) {
+    return this.request('/alerts', { params: { limit } });
+  }
+
+  /** The plant's stoppage reasons: `[{ key, label, kind }]`. */
+  async getStoppageReasons() {
+    return this.request('/config/stoppage-reasons');
+  }
+
   async updateConfig(config: Record<string, unknown>) {
     return this.request('/config', {
       method: 'PUT',
@@ -484,6 +494,16 @@ class ApiService {
   // Factory
   async getFactoryStats() {
     return this.request('/analytics/factory-stats');
+  }
+
+  /** Live snapshot of every machine the user may see. */
+  async getFloor() {
+    return this.request('/analytics/floor');
+  }
+
+  /** Lost time and output between two days, cut by reason, machine, shift, operator and mold. */
+  async getLosses(params: { startDate: string; endDate: string; departmentId?: string; machineId?: string }) {
+    return this.request('/analytics/losses', { params });
   }
 }
 

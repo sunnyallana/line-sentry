@@ -2,12 +2,15 @@ import React, { useEffect, useState, useRef, useMemo } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
 import { toast } from 'react-toastify';
-import { ArrowLeft, Settings, Activity, Plus, Edit, Power, Gauge, Trash2, Save, Wrench } from 'lucide-react';
+import { LayoutGrid, List, Move, Plus, Trash2, Wrench } from 'lucide-react';
 import { Department, Machine, MachineStats, MachineStatus } from '../types';
 import apiService from '../services/api';
 import { useAuth } from '../context/auth-context';
 import { useSocketEvent } from '../hooks/useSocketEvent';
-import { Button, Input, Label, Card, CardContent, Modal, PageLoader } from './ui';
+import {
+  Button, EmptyState, Field, IconButton, Input, Modal, PageHeader, PageLoader, Section, Segmented, Stat, StatStrip,
+  StatusDot, formatNumber, machineStatusLabel,
+} from './ui';
 import { cn } from '../lib/cn';
 
 const DEFAULT_W = 154;
@@ -16,29 +19,24 @@ const GRID = 8; // snap-to-grid step (px) for the layout editor
 const toSnakeCase = (str: string) => str.toLowerCase().replace(/\s+/g, '_');
 const errMsg = (e: unknown, fallback: string) => (e instanceof Error ? e.message : fallback);
 
-const statusDot = (s?: string) =>
-  s === 'running' ? 'bg-success' : s === 'stoppage' ? 'bg-destructive animate-pulse' : s === 'stopped_yet_producing' ? 'bg-warning' : 'bg-muted-foreground';
-const statusTextClass = (s?: string) =>
-  s === 'running' ? 'text-success' : s === 'stoppage' ? 'text-destructive' : s === 'stopped_yet_producing' ? 'text-warning' : 'text-muted-foreground';
-const statusLabel = (s?: string) =>
-  s === 'running' ? 'Running' : s === 'stoppage' ? 'Stoppage' : s === 'stopped_yet_producing' ? 'Stopped Yet Producing' : s === 'inactive' ? 'Inactive' : (s ?? '');
+/* The edge of a machine tile carries its state, so the floor reads at a glance. */
+const statusEdge = (s?: string) =>
+  s === 'running' ? 'bg-success' : s === 'stoppage' ? 'bg-destructive' : s === 'stopped_yet_producing' ? 'bg-warning' : 'bg-muted-foreground/40';
 
 const ytdRange = () => {
   const now = new Date();
   return { startDate: new Date(now.getFullYear(), 0, 1).toISOString(), endDate: now.toISOString() };
 };
 
-const StatCard: React.FC<{ label: string; value: React.ReactNode; icon: React.ReactNode; valueClass?: string }> = ({ label, value, icon, valueClass }) => (
-  <Card>
-    <CardContent className="flex items-center justify-between p-4">
-      <div>
-        <p className="text-sm text-muted-foreground">{label}</p>
-        <p className={cn('text-xl font-semibold text-foreground', valueClass)}>{value}</p>
-      </div>
-      {icon}
-    </CardContent>
-  </Card>
-);
+type ViewMode = 'floor' | 'list';
+const VIEW_KEY = 'department-view';
+const savedView = (): ViewMode => {
+  try {
+    return localStorage.getItem(VIEW_KEY) === 'list' ? 'list' : 'floor';
+  } catch {
+    return 'floor';
+  }
+};
 
 const DepartmentView: React.FC = () => {
   const { id } = useParams<{ id: string }>();
@@ -56,6 +54,15 @@ const DepartmentView: React.FC = () => {
   const [machineStatuses, setMachineStatuses] = useState<{ [key: string]: string }>({});
   const [machineStats, setMachineStats] = useState<{ [machineId: string]: MachineStats }>({});
   const [bgImageExists, setBgImageExists] = useState(false);
+  const [view, setViewState] = useState<ViewMode>(savedView);
+  const setView = (next: ViewMode) => {
+    setViewState(next);
+    try {
+      localStorage.setItem(VIEW_KEY, next);
+    } catch {
+      /* the choice just won't be remembered */
+    }
+  };
   const layoutContainerRef = useRef<HTMLDivElement>(null);
   const dragOffset = useRef({ x: 0, y: 0 });
   const resizeInitial = useRef({ width: 0, height: 0, x: 0, y: 0 });
@@ -134,7 +141,7 @@ const DepartmentView: React.FC = () => {
   const departmentStats = useMemo(() => {
     let totalUnits = 0, totalOEE = 0, running = 0, stopped = 0, withStats = 0;
     machines.forEach((machine) => {
-      if (machine.status === 'running') running++; else stopped++;
+      if (machine.status === 'running') running++; else if (machine.status === 'stoppage') stopped++;
       const s = machineStats[machine._id];
       if (s) { totalUnits += s.totalUnitsProduced || 0; totalOEE += s.oee || 0; withStats++; }
     });
@@ -155,7 +162,7 @@ const DepartmentView: React.FC = () => {
       setDimensions({ ...dimensions, [created._id]: { width: created.dimensions?.width || DEFAULT_W, height: created.dimensions?.height || DEFAULT_H } });
       setIsAddingMachine(false);
       setNewMachine({ name: '', description: '' });
-      toast.success('Machine added successfully');
+      toast.success(`${created.name} added. Wire its signals in Setup to start collecting data.`);
     } catch (err) {
       toast.error(errMsg(err, 'Failed to add machine'));
     }
@@ -251,66 +258,146 @@ const DepartmentView: React.FC = () => {
   };
 
   if (departmentQ.isLoading) return <PageLoader label="Loading department…" />;
-  if (!department) return <div className="py-12 text-center text-muted-foreground">Department not found</div>;
+  if (!department) {
+    return (
+      <EmptyState
+        title="Department not found"
+        description="It may have been removed."
+        action={<Button variant="outline" onClick={() => navigate('/dashboard')}>Back to overview</Button>}
+      />
+    );
+  }
+
+  const cancelLayoutEdit = () => {
+    // Put the tiles back where the server has them.
+    const pos: typeof positions = {};
+    const dim: typeof dimensions = {};
+    machines.forEach((m) => {
+      pos[m._id] = { ...m.position };
+      dim[m._id] = { width: m.dimensions?.width || DEFAULT_W, height: m.dimensions?.height || DEFAULT_H };
+    });
+    setPositions(pos);
+    setDimensions(dim);
+    setEditLayoutMode(false);
+    departmentQ.refetch();
+  };
+
+  const idle = machines.length - departmentStats.running - departmentStats.stopped;
+  const oeeOf = (m: Machine) => machineStats[m._id]?.oee;
+  const unitsOf = (m: Machine) => machineStats[m._id]?.totalUnitsProduced;
 
   return (
     <div className="space-y-6">
-      {/* Header */}
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-4">
-          <Button variant="ghost" size="icon" aria-label="Back to dashboard" onClick={() => navigate('/dashboard')}>
-            <ArrowLeft className="h-5 w-5" />
-          </Button>
-          <div>
-            <h1 className="text-2xl font-bold text-foreground">{department.name}</h1>
-            <p className="text-muted-foreground">{department.description}</p>
-          </div>
-        </div>
-        {isAdmin && (
-          <div className="flex items-center gap-2">
-            <Button onClick={() => setIsAddingMachine(true)}><Plus className="h-4 w-4" /> Add Machine</Button>
-            <Button variant="ghost" size="icon" aria-label={editLayoutMode ? 'Save layout' : 'Edit layout'} onClick={() => (editLayoutMode ? handleSaveLayout() : setEditLayoutMode(true))}>
-              {editLayoutMode ? <Save className="h-5 w-5" /> : <Settings className="h-5 w-5" />}
-            </Button>
-          </div>
-        )}
-      </div>
+      <PageHeader
+        title={department.name}
+        description={department.description}
+        onBack={() => navigate('/dashboard')}
+        backLabel="Back to overview"
+        actions={
+          isAdmin && !editLayoutMode ? (
+            <>
+              {view === 'floor' && machines.length > 0 && (
+                <Button variant="outline" onClick={() => setEditLayoutMode(true)}>
+                  <Move className="h-4 w-4" /> Arrange floor plan
+                </Button>
+              )}
+              <Button onClick={() => setIsAddingMachine(true)}><Plus className="h-4 w-4" /> Add machine</Button>
+            </>
+          ) : undefined
+        }
+      />
 
-      {/* Department stats */}
-      <div className="grid grid-cols-1 gap-4 md:grid-cols-4">
-        <StatCard label="Total Machines" value={machines.length} icon={<Activity className="h-8 w-8 text-primary" />} />
-        <StatCard label="Running" value={departmentStats.running} valueClass="text-success" icon={<Power className="h-8 w-8 text-success" />} />
-        <StatCard label="Stopped" value={departmentStats.stopped} valueClass="text-destructive" icon={<Activity className="h-8 w-8 text-destructive" />} />
-        <StatCard label="Department OEE (YTD)" value={`${departmentStats.avgOEE}%`} valueClass="text-warning" icon={<Gauge className="h-8 w-8 text-warning" />} />
-      </div>
+      <StatStrip>
+        <Stat label="Running now" value={departmentStats.running} unit={`of ${machines.length}`} hint={`${idle} idle`} />
+        <Stat label="Stopped" value={departmentStats.stopped} tone={departmentStats.stopped > 0 ? 'bad' : 'neutral'} />
+        <Stat label="OEE" value={departmentStats.avgOEE} unit="%" hint="Year to date" />
+        <Stat label="Units" value={formatNumber(departmentStats.totalUnits)} hint="Year to date" />
+      </StatStrip>
 
-      {/* Machine layout */}
-      <Card>
-        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border p-6">
-          <div className="flex flex-wrap items-center gap-4">
-            <h2 className="text-lg font-semibold text-foreground">Machine Layout</h2>
-            <div className="flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
-              <span className="flex items-center gap-1"><span className="h-2 w-2 rounded-full bg-success" /> Running</span>
-              <span className="flex items-center gap-1"><span className="h-2 w-2 rounded-full bg-destructive" /> Stoppage</span>
-              <span className="flex items-center gap-1"><span className="h-2 w-2 rounded-full bg-warning" /> Stopped/producing</span>
-              <span className="flex items-center gap-1"><span className="h-2 w-2 rounded-full bg-muted-foreground" /> Inactive</span>
+      <Section
+        flush
+        title="Machines"
+        actions={
+          editLayoutMode ? (
+            <>
+              <span className="mr-1 hidden text-[13px] text-muted-foreground md:inline">
+                Drag a machine to move it. Drag its corner to resize.
+              </span>
+              <Button variant="outline" size="sm" onClick={cancelLayoutEdit}>Cancel</Button>
+              <Button size="sm" onClick={handleSaveLayout}>Save floor plan</Button>
+            </>
+          ) : (
+            <Segmented<ViewMode>
+              ariaLabel="How to show machines"
+              value={view}
+              onChange={setView}
+              options={[
+                { value: 'floor', label: <><LayoutGrid className="h-3.5 w-3.5" /> Floor plan</> },
+                { value: 'list', label: <><List className="h-3.5 w-3.5" /> List</> },
+              ]}
+            />
+          )
+        }
+      >
+        {machines.length === 0 ? (
+          <EmptyState
+            title="No machines in this department"
+            description={isAdmin ? 'Add the first machine, then wire its signals in Setup.' : 'An administrator has not added machines here yet.'}
+            action={isAdmin ? <Button onClick={() => setIsAddingMachine(true)}><Plus className="h-4 w-4" /> Add machine</Button> : undefined}
+          />
+        ) : view === 'list' && !editLayoutMode ? (
+          <div className="scrollbar-thin overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead className="border-b border-border bg-muted/40 text-left text-xs text-muted-foreground">
+                <tr>
+                  <th scope="col" className="px-5 py-2 font-medium">Machine</th>
+                  <th scope="col" className="px-5 py-2 font-medium">State</th>
+                  <th scope="col" className="px-5 py-2 text-right font-medium">OEE (year to date)</th>
+                  <th scope="col" className="px-5 py-2 text-right font-medium">Units (year to date)</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-border">
+                {machines.map((machine) => (
+                  <tr
+                    key={machine._id}
+                    tabIndex={0}
+                    role="link"
+                    onClick={() => navigate(`/machine/${machine._id}`)}
+                    onKeyDown={(e) => { if (e.key === 'Enter') navigate(`/machine/${machine._id}`); }}
+                    className="cursor-pointer transition-colors duration-150 hover:bg-foreground/[0.03] focus-visible:ring-inset"
+                  >
+                    <td className="px-5 py-2.5">
+                      <div className="flex items-center gap-2">
+                        <span className="font-medium text-foreground">{machine.name}</span>
+                        {isAdmin && readyMap.get(machine._id) === false && (
+                          <span className="inline-flex items-center gap-1 text-xs text-warning" title="Signals are not wired yet. Finish this machine in Setup.">
+                            <Wrench className="h-3 w-3" /> Setup needed
+                          </span>
+                        )}
+                      </div>
+                      {machine.description && <p className="text-xs text-muted-foreground">{machine.description}</p>}
+                    </td>
+                    <td className="px-5 py-2.5"><StatusDot status={liveStatus(machine)} /></td>
+                    <td className="px-5 py-2.5 text-right">{oeeOf(machine) != null ? `${oeeOf(machine)}%` : '–'}</td>
+                    <td className="px-5 py-2.5 text-right">{formatNumber(unitsOf(machine))}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <div className="p-4">
+            <div className="mb-3 flex flex-wrap items-center gap-x-4 gap-y-1">
+              {(['running', 'stoppage', 'stopped_yet_producing', 'inactive'] as const).map((s) => (
+                <StatusDot key={s} status={s} className="text-xs text-muted-foreground" />
+              ))}
             </div>
-          </div>
-          {isAdmin && (
-            <button
-              onClick={() => (editLayoutMode ? handleSaveLayout() : setEditLayoutMode(true))}
-              className="flex items-center gap-1 text-sm text-primary hover:underline"
-            >
-              <Edit className="h-4 w-4" /> {editLayoutMode ? 'Save Layout' : 'Edit Layout'}
-            </button>
-          )}
-        </div>
-
-        <div className="p-6">
-          {machines.length > 0 ? (
             <div
               ref={layoutContainerRef}
-              className="relative min-h-[700px] w-full rounded-lg border border-dashed border-border bg-muted/40"
+              className={cn(
+                'scrollbar-thin relative min-h-[640px] w-full overflow-auto rounded-md bg-muted/40',
+                editLayoutMode && 'bg-[radial-gradient(hsl(var(--border))_1px,transparent_1px)] [background-size:16px_16px]',
+              )}
               style={bgImageExists ? { backgroundImage: `url(/${toSnakeCase(department.name)}.png)`, backgroundSize: 'contain', backgroundPosition: 'center', backgroundRepeat: 'no-repeat' } : {}}
               onMouseMove={handleMouseMove}
               onMouseUp={handleMouseUp}
@@ -319,140 +406,109 @@ const DepartmentView: React.FC = () => {
               {machines.map((machine) => {
                 const width = dimensions[machine._id]?.width || DEFAULT_W;
                 const height = dimensions[machine._id]?.height || DEFAULT_H;
-                const isSmall = width < 100 || height < 100;
+                const isSmall = width < 110 || height < 96;
                 const active = draggingMachineId === machine._id || resizingMachineId === machine._id;
                 const status = liveStatus(machine);
+                const needsSetup = isAdmin && readyMap.get(machine._id) === false;
                 return (
                   <div
                     key={machine._id}
+                    role={editLayoutMode ? undefined : 'link'}
+                    tabIndex={editLayoutMode ? undefined : 0}
+                    aria-label={`${machine.name}, ${machineStatusLabel(status)}`}
+                    title={isSmall ? `${machine.name} · ${machineStatusLabel(status)}` : undefined}
                     onClick={() => handleMachineClick(machine._id)}
+                    onKeyDown={(e) => { if (e.key === 'Enter') handleMachineClick(machine._id); }}
                     onMouseDown={(e) => handleMouseDown(machine._id, e)}
                     className={cn(
-                      'absolute flex flex-col rounded-lg border bg-card transition-all duration-200',
-                      editLayoutMode ? 'cursor-move border-primary' : 'border-border hover:border-primary hover:shadow-md',
+                      'absolute flex overflow-hidden rounded-md border bg-card',
+                      editLayoutMode
+                        ? 'cursor-move border-primary/60'
+                        : 'cursor-pointer border-border hover:border-foreground/30 hover:shadow-md',
+                      active ? 'z-10 shadow-md' : 'z-[1] transition-[box-shadow,border-color] duration-150',
                     )}
                     style={{
                       left: `${positions[machine._id]?.x || 0}px`,
                       top: `${positions[machine._id]?.y || 0}px`,
                       width: `${width}px`,
                       height: `${height}px`,
-                      zIndex: active ? 10 : 1,
-                      transform: active ? 'scale(1.02)' : 'none',
-                      transition: active ? 'none' : 'all 0.2s ease',
-                      padding: isSmall ? '0.25rem' : '0.75rem',
                     }}
                   >
-                    <div className="flex w-full items-center justify-between">
-                      <h3 className="truncate font-medium text-foreground" style={{ fontSize: isSmall ? '0.65rem' : '0.875rem', maxWidth: isSmall ? `${width - 30}px` : '100%' }}>
-                        {machine.name}
-                      </h3>
-                      <div className="flex items-center gap-1">
-                        {isAdmin && readyMap.get(machine._id) === false && !isSmall && (
-                          <span title="Setup incomplete — wire this machine's signals"><Wrench className="h-3 w-3 text-warning" /></span>
-                        )}
-                        <div className={cn('rounded-full', statusDot(status))} style={{ width: isSmall ? '0.5rem' : '0.75rem', height: isSmall ? '0.5rem' : '0.75rem', minWidth: isSmall ? '0.5rem' : '0.75rem' }} />
-                        {editLayoutMode && !isSmall && (
-                          <button onClick={(e) => handleDeleteMachine(machine._id, e)} className="rounded-md p-1 text-destructive hover:bg-muted">
-                            <Trash2 className="h-3 w-3" />
-                          </button>
+                    <span className={cn('w-1 shrink-0', statusEdge(status))} aria-hidden />
+                    <div className={cn('flex min-w-0 flex-1 flex-col', isSmall ? 'p-1.5' : 'p-3')}>
+                      <div className="flex items-start justify-between gap-1">
+                        <h3 className={cn('truncate font-medium text-foreground', isSmall ? 'text-[11px]' : 'text-[13px]')}>{machine.name}</h3>
+                        {needsSetup && !isSmall && (
+                          <span title="Signals are not wired yet. Finish this machine in Setup."><Wrench className="h-3.5 w-3.5 text-warning" /></span>
                         )}
                       </div>
-                    </div>
+                      <p className={cn('truncate text-muted-foreground', isSmall ? 'text-[10px]' : 'text-xs')}>{machineStatusLabel(status)}</p>
 
-                    <div className="mt-1 w-full">
-                      <span className="block truncate text-muted-foreground" style={{ fontSize: isSmall ? '0.65rem' : '0.75rem' }}>
-                        {machine.description || 'No description'}
-                      </span>
+                      {!isSmall && (
+                        <dl className="mt-auto grid grid-cols-2 gap-2 pt-2">
+                          <div>
+                            <dt className="text-[11px] text-muted-foreground">OEE</dt>
+                            <dd className="text-sm font-semibold text-foreground">{oeeOf(machine) != null ? `${oeeOf(machine)}%` : '–'}</dd>
+                          </div>
+                          <div>
+                            <dt className="text-[11px] text-muted-foreground">Units</dt>
+                            <dd className="text-sm font-semibold text-foreground">{formatNumber(unitsOf(machine))}</dd>
+                          </div>
+                        </dl>
+                      )}
                     </div>
-
-                    <div className="mt-1 w-full">
-                      <span className={cn('font-medium', statusTextClass(status))} style={{ fontSize: isSmall ? '0.65rem' : '0.75rem' }}>
-                        {statusLabel(status)}
-                      </span>
-                    </div>
-
-                    {!isSmall && (
-                      <div className="mt-auto space-y-1">
-                        <div className="flex w-full items-center justify-between" style={{ fontSize: '0.7rem' }}>
-                          <span className="text-muted-foreground">OEE (YTD)</span>
-                          <span className="font-medium text-foreground">{machineStats[machine._id]?.oee ?? 'N/A'}%</span>
-                        </div>
-                        <div className="flex w-full items-center justify-between" style={{ fontSize: '0.7rem' }}>
-                          <span className="text-muted-foreground">Units</span>
-                          <span className="font-medium text-foreground">{machineStats[machine._id]?.totalUnitsProduced ?? 'N/A'}</span>
-                        </div>
-                      </div>
-                    )}
 
                     {editLayoutMode && (
-                      <div className="absolute bottom-0 right-0 h-4 w-4 cursor-se-resize text-foreground" onMouseDown={(e) => handleResizeMouseDown(machine._id, e)}>
-                        <div className="h-full w-full" style={{ borderBottom: '2px solid currentColor', borderRight: '2px solid currentColor', borderBottomRightRadius: '0.25rem' }} />
-                      </div>
-                    )}
-                    {editLayoutMode && isSmall && (
-                      <button onClick={(e) => handleDeleteMachine(machine._id, e)} className="absolute right-0 top-0 rounded-md p-1 text-destructive hover:bg-muted" style={{ zIndex: 20 }}>
-                        <Trash2 className="h-3 w-3" />
-                      </button>
+                      <>
+                        <IconButton
+                          label={`Delete ${machine.name}`}
+                          danger
+                          className="absolute right-0.5 top-0.5 h-6 w-6 bg-card"
+                          onMouseDown={(e) => e.stopPropagation()}
+                          onClick={(e) => handleDeleteMachine(machine._id, e)}
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </IconButton>
+                        <div
+                          className="absolute bottom-0 right-0 h-4 w-4 cursor-se-resize"
+                          onMouseDown={(e) => handleResizeMouseDown(machine._id, e)}
+                          aria-hidden
+                        >
+                          <div className="absolute bottom-1 right-1 h-2 w-2 border-b-2 border-r-2 border-muted-foreground" />
+                        </div>
+                      </>
                     )}
                   </div>
                 );
               })}
             </div>
-          ) : (
-            <div className="py-12 text-center">
-              <Activity className="mx-auto mb-4 h-12 w-12 text-muted-foreground" />
-              <h3 className="mb-2 text-lg font-medium text-foreground">No machines found</h3>
-              <p className="mb-4 text-muted-foreground">This department doesn't have any machines configured yet.</p>
-              {isAdmin && <Button onClick={() => setIsAddingMachine(true)}><Plus className="h-4 w-4" /> Add First Machine</Button>}
-            </div>
-          )}
-        </div>
-      </Card>
+          </div>
+        )}
+      </Section>
 
-      {/* Edit layout controls */}
-      {editLayoutMode && (
-        <Card>
-          <CardContent className="flex flex-wrap items-center justify-between gap-3 p-4">
-            <p className="flex items-center gap-2 text-sm text-warning">
-              <Edit className="h-4 w-4" />
-              Layout Edit Mode: drag to reposition, resize with the bottom-right handle, or delete with the trash icon.
-            </p>
-            <div className="flex gap-2">
-              <Button variant="outline" onClick={() => setEditLayoutMode(false)}>Cancel</Button>
-              <Button onClick={handleSaveLayout}><Save className="h-4 w-4" /> Save Layout</Button>
-            </div>
-          </CardContent>
-        </Card>
-      )}
-
-      {/* Add machine modal */}
       <Modal
         open={isAddingMachine}
         onClose={() => setIsAddingMachine(false)}
-        title="Add new machine"
+        title="Add machine"
+        description={`It will be added to ${department.name}.`}
         footer={
           <>
             <Button variant="outline" onClick={() => setIsAddingMachine(false)}>Cancel</Button>
-            <Button onClick={handleAddMachine} disabled={!newMachine.name.trim()}>Add Machine</Button>
+            <Button onClick={handleAddMachine} disabled={!newMachine.name.trim()}>Add machine</Button>
           </>
         }
       >
-        <div className="space-y-4">
-          <div>
-            <Label htmlFor="machine-name">Machine name *</Label>
-            <Input id="machine-name" value={newMachine.name} onChange={(e) => setNewMachine({ ...newMachine, name: e.target.value })} />
-          </div>
-          <div>
-            <Label htmlFor="machine-desc">Description</Label>
-            <textarea
-              id="machine-desc"
-              rows={3}
-              className="flex w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-              value={newMachine.description}
-              onChange={(e) => setNewMachine({ ...newMachine, description: e.target.value })}
-            />
-          </div>
-        </div>
+        <form
+          className="space-y-4"
+          onSubmit={(e) => { e.preventDefault(); if (newMachine.name.trim()) handleAddMachine(); }}
+        >
+          <Field label="Name">
+            <Input value={newMachine.name} placeholder="e.g. Injection press 4" onChange={(e) => setNewMachine({ ...newMachine, name: e.target.value })} />
+          </Field>
+          <Field label="Description" hint="Optional. Shown under the name.">
+            <Input value={newMachine.description} onChange={(e) => setNewMachine({ ...newMachine, description: e.target.value })} />
+          </Field>
+        </form>
       </Modal>
     </div>
   );

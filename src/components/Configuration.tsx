@@ -1,12 +1,14 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { useForm, useFieldArray, Controller, type FieldPath } from 'react-hook-form';
+import { useForm, useFieldArray, Controller, get, type FieldPath } from 'react-hook-form';
 import { z } from 'zod';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { toast } from 'react-toastify';
-import { Network, Mail, Save, Clock, BarChart2, Plus, Trash2, Link as LinkIcon } from 'lucide-react';
+import { Plus, Trash2 } from 'lucide-react';
 import apiService from '../services/api';
-import { Button, Input, Label, Select, Card, CardHeader, CardTitle, CardContent, Badge, PageLoader } from './ui';
+import { Button, Field, IconButton, Input, PageHeader, PageLoader, Section, Select, Tabs } from './ui';
 import { cn } from '../lib/cn';
+import StoppageReasonsSettings from './StoppageReasonsSettings';
+import AlertsSettings from './AlertsSettings';
 
 /* Per-section schemas — each tab validates and saves independently, so an
    incomplete section (e.g. no email recipients yet) never blocks another. */
@@ -17,6 +19,11 @@ const emailSchema = z.object({
   senderEmail: z.string().email('Invalid email format'),
   senderPassword: z.string().min(1, 'Password is required'),
   recipients: z.array(z.string().email('Invalid recipient email')).min(1, 'Add at least one recipient'),
+});
+const reportScheduleSchema = z.object({
+  enabled: z.boolean(),
+  hour: z.number().int().min(0).max(23),
+  email: z.boolean(),
 });
 const shiftSchema = z.object({
   name: z.string().min(1, 'Name is required'),
@@ -34,28 +41,45 @@ type FormData = {
   plc: z.infer<typeof plcSchema>;
   signalTimeouts: z.infer<typeof timeoutsSchema>;
   email: z.infer<typeof emailSchema>;
+  reportSchedule: z.infer<typeof reportScheduleSchema>;
   shifts: z.infer<typeof shiftsSchema>;
   metricsThresholds: z.infer<typeof thresholdsSchema>;
 };
 
-const METRICS = ['oee', 'availability', 'quality', 'performance', 'mtbf', 'mttr', 'reliability'] as const;
-const LEVELS = ['excellent', 'good', 'fair'] as const;
+const METRICS = [
+  { key: 'oee', label: 'OEE', unit: '%' },
+  { key: 'availability', label: 'Availability', unit: '%' },
+  { key: 'quality', label: 'Quality', unit: '%' },
+  { key: 'performance', label: 'Performance', unit: '%' },
+  { key: 'mtbf', label: 'MTBF', unit: 'min' },
+  { key: 'mttr', label: 'MTTR', unit: 'min' },
+  { key: 'reliability', label: 'Reliability', unit: '' },
+] as const;
+const LEVELS = [
+  { key: 'excellent', label: 'Excellent' },
+  { key: 'good', label: 'Good' },
+  { key: 'fair', label: 'Fair' },
+] as const;
 const PINS = Array.from({ length: 8 }, (_, i) => `DQ.${i}`);
 const TABS = [
-  { id: 'plc', label: 'PLC', icon: Network },
-  { id: 'signalTimeouts', label: 'Signal Timeouts', icon: Clock },
-  { id: 'shifts', label: 'Shifts', icon: Clock },
-  { id: 'email', label: 'Email', icon: Mail },
-  { id: 'metricsThresholds', label: 'Thresholds', icon: BarChart2 },
-  { id: 'pins', label: 'Pin Mappings', icon: LinkIcon },
+  { id: 'plc', label: 'PLC' },
+  { id: 'signalTimeouts', label: 'Signal timeouts' },
+  { id: 'shifts', label: 'Shifts' },
+  { id: 'reasons', label: 'Stoppage reasons' },
+  { id: 'alerts', label: 'Alerts' },
+  { id: 'email', label: 'Email and daily report' },
+  { id: 'metricsThresholds', label: 'Thresholds' },
+  { id: 'pins', label: 'Pin mappings' },
 ] as const;
 type TabId = (typeof TABS)[number]['id'];
+const TAB_OPTIONS = TABS.map((t) => ({ value: t.id as TabId, label: t.label }));
 
 const errMsg = (e: unknown, fallback: string) => (e instanceof Error ? e.message : fallback);
 const defaults: FormData = {
   plc: { ip: '', rack: 0, slot: 1 },
   signalTimeouts: { powerSignalTimeout: 5, cycleSignalTimeout: 2 },
   email: { senderEmail: '', senderPassword: '', recipients: [] },
+  reportSchedule: { enabled: false, hour: 6, email: true },
   shifts: [],
   metricsThresholds: {
     oee: { excellent: 85, good: 70, fair: 50 },
@@ -70,6 +94,10 @@ const defaults: FormData = {
 
 interface PinMapping { _id: string; pinId: string; sensorId?: { name?: string } }
 interface SensorLite { _id: string; name: string }
+
+const invalidInput = 'border-destructive focus-visible:border-destructive focus-visible:ring-destructive/20';
+const checkbox = 'h-4 w-4 shrink-0 accent-[hsl(var(--primary))]';
+const th = 'whitespace-nowrap px-5 py-2 font-medium';
 
 const Configuration: React.FC = () => {
   const queryClient = useQueryClient();
@@ -90,6 +118,7 @@ const Configuration: React.FC = () => {
       plc: configQ.data.plc ?? defaults.plc,
       signalTimeouts: configQ.data.signalTimeouts ?? defaults.signalTimeouts,
       email: { ...defaults.email, ...configQ.data.email, recipients: configQ.data.email?.recipients ?? [] },
+      reportSchedule: { ...defaults.reportSchedule, ...configQ.data.reportSchedule },
       shifts: configQ.data.shifts ?? [],
       metricsThresholds: configQ.data.metricsThresholds ?? defaults.metricsThresholds,
     });
@@ -133,186 +162,301 @@ const Configuration: React.FC = () => {
   const usedPins = new Set((pinsQ.data ?? []).map((p) => p.pinId));
   const freePins = PINS.filter((p) => !usedPins.has(p));
 
-  if (configQ.isLoading) return <PageLoader label="Loading configuration…" />;
+  if (configQ.isLoading) return <PageLoader label="Loading settings…" />;
 
-  const numberField = (name: FieldPath<FormData>, label: string, opts?: { min?: number; max?: number }) => (
-    <div>
-      <Label>{label}</Label>
+  const errorOf = (name: string): string | undefined => get(errors, name)?.message;
+
+  const numberField = (name: FieldPath<FormData>, label: string, opts?: { min?: number; max?: number; hint?: string }) => (
+    <Field label={label} hint={opts?.hint} error={errorOf(name)}>
       <Input type="number" min={opts?.min} max={opts?.max} {...register(name, { valueAsNumber: true })} />
+    </Field>
+  );
+  const saveBar = (onSave: () => void) => (
+    <div className="flex justify-end border-t border-border px-5 py-3">
+      <Button type="button" loading={saveMut.isPending} onClick={onSave}>Save changes</Button>
     </div>
   );
-  const SaveBar: React.FC<{ onSave: () => void }> = ({ onSave }) => (
-    <div className="mt-5 flex justify-end border-t border-border pt-4">
-      <Button type="button" loading={saveMut.isPending} onClick={onSave}><Save className="h-4 w-4" /> Save changes</Button>
-    </div>
-  );
+
+  const pinMappings = pinsQ.data ?? [];
 
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-bold text-foreground">Configuration</h1>
-        <p className="text-muted-foreground">Each section saves on its own — set up what you need, when you need it.</p>
-      </div>
+      <PageHeader title="Settings" description="Each section saves on its own." />
 
-      {/* Tabs */}
-      <div className="flex flex-wrap gap-2 border-b border-border">
-        {TABS.map((t) => (
-          <button
-            key={t.id}
-            onClick={() => setTab(t.id)}
-            className={cn(
-              'inline-flex items-center gap-2 border-b-2 px-3 py-2 text-sm font-medium transition-colors',
-              tab === t.id ? 'border-primary text-primary' : 'border-transparent text-muted-foreground hover:text-foreground',
-            )}
-          >
-            <t.icon className="h-4 w-4" /> {t.label}
-          </button>
-        ))}
-      </div>
+      <Tabs value={tab} onChange={setTab} tabs={TAB_OPTIONS} ariaLabel="Settings sections" />
 
       {tab === 'plc' && (
-        <Card><CardContent className="p-6">
-          <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
-            <div className="sm:col-span-1"><Label>PLC IP address</Label><Input {...register('plc.ip')} />
-              {errors.plc?.ip && <p className="mt-1 text-sm text-destructive">{errors.plc.ip.message}</p>}</div>
-            {numberField('plc.rack', 'Rack', { min: 0 })}
-            {numberField('plc.slot', 'Slot', { min: 0 })}
+        <Section flush title="PLC connection" description="The network address of the main PLC that LineSentry reads signals from.">
+          <div className="grid grid-cols-1 gap-4 p-5 sm:grid-cols-[minmax(0,2fr)_minmax(0,1fr)_minmax(0,1fr)]">
+            <Field label="IP address" error={errors.plc?.ip?.message}>
+              <Input placeholder="192.168.0.1" {...register('plc.ip')} />
+            </Field>
+            {numberField('plc.rack', 'Rack', { min: 0, hint: 'Usually 0.' })}
+            {numberField('plc.slot', 'Slot', { min: 0, hint: 'Usually 1.' })}
           </div>
-          <SaveBar onSave={() => saveSection('plc', plcSchema)} />
-        </CardContent></Card>
+          {saveBar(() => saveSection('plc', plcSchema))}
+        </Section>
       )}
 
       {tab === 'signalTimeouts' && (
-        <Card><CardContent className="p-6">
-          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-            {numberField('signalTimeouts.powerSignalTimeout', 'Power signal timeout (min)', { min: 1, max: 60 })}
-            {numberField('signalTimeouts.cycleSignalTimeout', 'Cycle signal timeout (min)', { min: 1, max: 60 })}
+        <Section flush title="Signal timeouts" description="How long LineSentry waits for a signal before it changes a machine's state.">
+          <div className="grid grid-cols-1 gap-4 p-5 sm:grid-cols-2">
+            {numberField('signalTimeouts.powerSignalTimeout', 'Power signal timeout (minutes)', {
+              min: 1,
+              max: 60,
+              hint: 'A machine counts as powered if a power signal arrived within this many minutes. From 1 to 60.',
+            })}
+            {numberField('signalTimeouts.cycleSignalTimeout', 'Unit-cycle signal timeout (minutes)', {
+              min: 1,
+              max: 60,
+              hint: 'A machine counts as producing if a unit-cycle signal arrived within this many minutes. From 1 to 60.',
+            })}
           </div>
-          <p className="mt-3 text-sm text-muted-foreground">How long without a signal before a machine is considered stopped (power) or its cycle has ended (cycle).</p>
-          <SaveBar onSave={() => saveSection('signalTimeouts', timeoutsSchema)} />
-        </CardContent></Card>
+          {saveBar(() => saveSection('signalTimeouts', timeoutsSchema))}
+        </Section>
       )}
 
       {tab === 'shifts' && (
-        <Card><CardContent className="p-6">
-          <div className="space-y-3">
-            {shifts.fields.length === 0 && <p className="text-sm text-muted-foreground">No shifts yet. Add one to enable shift-wide operator/mold assignment on the timeline.</p>}
-            {shifts.fields.map((f, i) => (
-              <div key={f.id} className="flex flex-wrap items-end gap-3 rounded-md border border-border p-3">
-                <div className="min-w-[140px] flex-1">
-                  <Label>Name</Label><Input {...register(`shifts.${i}.name`)} />
-                  {errors.shifts?.[i]?.name && <p className="mt-1 text-sm text-destructive">{errors.shifts[i]?.name?.message}</p>}
-                </div>
-                <div><Label>Start</Label><Input type="time" {...register(`shifts.${i}.startTime`)} /></div>
-                <div><Label>End</Label><Input type="time" {...register(`shifts.${i}.endTime`)} /></div>
-                <label className="flex items-center gap-2 pb-2 text-sm text-foreground">
-                  <input type="checkbox" {...register(`shifts.${i}.isActive`)} /> Active
-                </label>
-                <Button type="button" variant="ghost" size="icon" aria-label="Remove shift" onClick={() => shifts.remove(i)}>
-                  <Trash2 className="h-4 w-4 text-destructive" />
-                </Button>
-              </div>
-            ))}
-            <Button type="button" variant="outline" onClick={() => shifts.append({ name: '', startTime: '06:00', endTime: '14:00', isActive: true })}>
+        <Section
+          flush
+          title="Shifts"
+          description="Shifts let you assign an operator or a mold to a whole shift on the timeline."
+          actions={
+            <Button type="button" variant="outline" size="sm" onClick={() => shifts.append({ name: '', startTime: '06:00', endTime: '14:00', isActive: true })}>
               <Plus className="h-4 w-4" /> Add shift
             </Button>
-          </div>
-          <SaveBar onSave={() => saveSection('shifts', shiftsSchema)} />
-        </CardContent></Card>
+          }
+        >
+          {shifts.fields.length === 0 ? (
+            <p className="px-5 py-6 text-[13px] text-muted-foreground">No shifts yet. Add one, then save.</p>
+          ) : (
+            <div className="scrollbar-thin overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead className="border-b border-border bg-muted/40 text-left text-xs text-muted-foreground">
+                  <tr>
+                    <th scope="col" className={th}>Name</th>
+                    <th scope="col" className={th}>Start</th>
+                    <th scope="col" className={th}>End</th>
+                    <th scope="col" className={th}>Active</th>
+                    <th scope="col" className={th}><span className="sr-only">Actions</span></th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-border">
+                  {shifts.fields.map((f, i) => {
+                    const rowErrors = errors.shifts?.[i];
+                    return (
+                      <tr key={f.id}>
+                        <td className="min-w-[12rem] px-5 py-2 align-top">
+                          <Input
+                            aria-label="Shift name"
+                            placeholder="Morning"
+                            className={cn(rowErrors?.name && invalidInput)}
+                            aria-invalid={rowErrors?.name ? true : undefined}
+                            {...register(`shifts.${i}.name`)}
+                          />
+                          {rowErrors?.name && <p className="mt-1 text-xs text-destructive">{rowErrors.name.message}</p>}
+                        </td>
+                        <td className="w-36 px-5 py-2 align-top">
+                          <Input
+                            type="time"
+                            aria-label="Start time"
+                            className={cn(rowErrors?.startTime && invalidInput)}
+                            aria-invalid={rowErrors?.startTime ? true : undefined}
+                            {...register(`shifts.${i}.startTime`)}
+                          />
+                          {rowErrors?.startTime && <p className="mt-1 text-xs text-destructive">Enter a start time.</p>}
+                        </td>
+                        <td className="w-36 px-5 py-2 align-top">
+                          <Input
+                            type="time"
+                            aria-label="End time"
+                            className={cn(rowErrors?.endTime && invalidInput)}
+                            aria-invalid={rowErrors?.endTime ? true : undefined}
+                            {...register(`shifts.${i}.endTime`)}
+                          />
+                          {rowErrors?.endTime && <p className="mt-1 text-xs text-destructive">Enter an end time.</p>}
+                        </td>
+                        <td className="w-20 px-5 py-2 align-top">
+                          <span className="flex h-9 items-center">
+                            <input type="checkbox" aria-label="Active" className={checkbox} {...register(`shifts.${i}.isActive`)} />
+                          </span>
+                        </td>
+                        <td className="w-16 px-5 py-2 text-right align-top">
+                          <IconButton label="Remove shift" danger className="mt-0.5" onClick={() => shifts.remove(i)}>
+                            <Trash2 className="h-4 w-4" />
+                          </IconButton>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+          {saveBar(() => saveSection('shifts', shiftsSchema))}
+        </Section>
       )}
 
       {tab === 'email' && (
-        <Card><CardContent className="p-6">
-          <div className="space-y-4">
+        <Section flush title="Email" description="The account reports are sent from, and who receives them.">
+          <div className="space-y-4 p-5">
             <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-              <div><Label>Sender email</Label><Input type="email" {...register('email.senderEmail')} />
-                {errors.email?.senderEmail && <p className="mt-1 text-sm text-destructive">{errors.email.senderEmail.message}</p>}</div>
-              <div><Label>Sender app password</Label><Input type="password" autoComplete="off" {...register('email.senderPassword')} />
-                {errors.email?.senderPassword && <p className="mt-1 text-sm text-destructive">{errors.email.senderPassword.message}</p>}</div>
+              <Field label="Sender email" error={errors.email?.senderEmail?.message}>
+                <Input type="email" {...register('email.senderEmail')} />
+              </Field>
+              <Field
+                label="Sender app password"
+                hint="A password created for this app in the email account's security settings, not the normal sign-in password."
+                error={errors.email?.senderPassword?.message}
+              >
+                <Input type="password" autoComplete="off" {...register('email.senderPassword')} />
+              </Field>
             </div>
-            <div>
-              <Label>Recipients (one per line)</Label>
+            <Field
+              label="Recipients"
+              hint="One email address per line."
+              error={errors.email?.recipients ? get(errors, 'email.recipients.message') || get(errors, 'email.recipients.root.message') || 'Check the recipient addresses.' : undefined}
+            >
               <Controller
                 control={control}
                 name="email.recipients"
                 render={({ field }) => (
                   <textarea
                     rows={4}
-                    className="flex w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    className={cn(
+                      'flex w-full rounded-md border border-input bg-card px-3 py-2 text-sm text-foreground',
+                      'transition-[border-color,box-shadow] duration-150 ease-out hover:border-foreground/30',
+                      'focus-visible:border-primary focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-primary/20',
+                    )}
                     value={(field.value ?? []).join('\n')}
                     onChange={(e) => field.onChange(e.target.value.split(/[\n,]+/).map((s) => s.trim()).filter(Boolean))}
                   />
                 )}
               />
-              {errors.email?.recipients && <p className="mt-1 text-sm text-destructive">{(errors.email.recipients.message as string) || 'Add at least one recipient'}</p>}
-            </div>
+            </Field>
           </div>
-          <SaveBar onSave={() => saveSection('email', emailSchema)} />
-        </CardContent></Card>
+          {saveBar(() => saveSection('email', emailSchema))}
+        </Section>
+      )}
+
+      {tab === 'email' && (
+        <Section
+          flush
+          title="Daily report"
+          description="Saves a report for the previous day once the factory clock reaches the chosen hour."
+        >
+          <div className="space-y-4 p-5">
+            <label className="flex items-start gap-3">
+              <input type="checkbox" className={cn(checkbox, 'mt-0.5')} {...register('reportSchedule.enabled')} />
+              <span>
+                <span className="block text-sm text-foreground">Generate a report every day</span>
+                <span className="block text-xs text-muted-foreground">It appears on the Reports page.</span>
+              </span>
+            </label>
+            <Field label="Time" hint="Factory time." className="max-w-[12rem]" error={errorOf('reportSchedule.hour')}>
+              <Select {...register('reportSchedule.hour', { valueAsNumber: true })}>
+                {Array.from({ length: 24 }, (_, h) => (
+                  <option key={h} value={h}>{String(h).padStart(2, '0')}:00</option>
+                ))}
+              </Select>
+            </Field>
+            <label className="flex items-start gap-3">
+              <input type="checkbox" className={cn(checkbox, 'mt-0.5')} {...register('reportSchedule.email')} />
+              <span>
+                <span className="block text-sm text-foreground">Email it to the recipients</span>
+                <span className="block text-xs text-muted-foreground">Uses the sender and recipients in the Email section above.</span>
+              </span>
+            </label>
+          </div>
+          {saveBar(() => saveSection('reportSchedule', reportScheduleSchema))}
+        </Section>
       )}
 
       {tab === 'metricsThresholds' && (
-        <Card><CardContent className="p-6">
-          <p className="mb-4 text-sm text-muted-foreground">Bands used to color OEE/MTTR/MTBF metrics across the dashboard.</p>
-          <div className="overflow-x-auto">
+        <Section
+          flush
+          title="Thresholds"
+          description="The values at which each figure is rated excellent, good or fair across the app."
+        >
+          <div className="scrollbar-thin overflow-x-auto">
             <table className="w-full text-sm">
-              <thead className="text-left text-xs uppercase text-muted-foreground">
-                <tr><th className="py-2 pr-4">Metric</th><th className="py-2 pr-4">Excellent</th><th className="py-2 pr-4">Good</th><th className="py-2">Fair</th></tr>
+              <thead className="border-b border-border bg-muted/40 text-left text-xs text-muted-foreground">
+                <tr>
+                  <th scope="col" className={th}>Metric</th>
+                  {LEVELS.map((l) => <th key={l.key} scope="col" className={th}>{l.label}</th>)}
+                </tr>
               </thead>
-              <tbody>
+              <tbody className="divide-y divide-border">
                 {METRICS.map((m) => (
-                  <tr key={m} className="border-t border-border">
-                    <td className="py-2 pr-4 font-medium capitalize text-foreground">{m}</td>
-                    {LEVELS.map((l) => (
-                      <td key={l} className="py-2 pr-4"><Input className="w-24" type="number" {...register(`metricsThresholds.${m}.${l}`, { valueAsNumber: true })} /></td>
-                    ))}
+                  <tr key={m.key}>
+                    <th scope="row" className="whitespace-nowrap px-5 py-2 text-left font-medium text-foreground">
+                      {m.label}
+                      {m.unit && <span className="ml-1.5 text-xs font-normal text-muted-foreground">{m.unit}</span>}
+                    </th>
+                    {LEVELS.map((l) => {
+                      const invalid = Boolean(errors.metricsThresholds?.[m.key]?.[l.key]);
+                      return (
+                        <td key={l.key} className="px-5 py-1.5">
+                          <Input
+                            type="number"
+                            min={0}
+                            aria-label={`${m.label}, ${l.label.toLowerCase()}`}
+                            aria-invalid={invalid ? true : undefined}
+                            className={cn('tabular h-8 w-24', invalid && invalidInput)}
+                            {...register(`metricsThresholds.${m.key}.${l.key}`, { valueAsNumber: true })}
+                          />
+                        </td>
+                      );
+                    })}
                   </tr>
                 ))}
               </tbody>
             </table>
           </div>
-          <SaveBar onSave={() => saveSection('metricsThresholds', thresholdsSchema)} />
-        </CardContent></Card>
+          {saveBar(() => saveSection('metricsThresholds', thresholdsSchema))}
+        </Section>
       )}
 
-      {tab === 'pins' && (
-        <Card>
-          <CardHeader><CardTitle>Sensor → PLC pin mappings</CardTitle></CardHeader>
-          <CardContent className="space-y-4">
-            <div className="flex flex-wrap items-end gap-3 rounded-md border border-border p-3">
-              <div className="min-w-[180px] flex-1">
-                <Label>Sensor</Label>
-                <Select value={pinForm.sensorId} onChange={(e) => setPinForm({ ...pinForm, sensorId: e.target.value })}>
-                  <option value="">Select sensor…</option>
-                  {(sensorsQ.data ?? []).map((s) => <option key={s._id} value={s._id}>{s.name}</option>)}
-                </Select>
-              </div>
-              <div>
-                <Label>Pin</Label>
-                <Select value={pinForm.pinId} onChange={(e) => setPinForm({ ...pinForm, pinId: e.target.value })}>
-                  <option value="">Select pin…</option>
-                  {freePins.map((p) => <option key={p} value={p}>{p}</option>)}
-                </Select>
-              </div>
-              <Button type="button" disabled={!pinForm.sensorId || !pinForm.pinId} loading={addPinMut.isPending} onClick={() => addPinMut.mutate(pinForm, { onSuccess: () => setPinForm({ sensorId: '', pinId: '' }) })}>
-                <Plus className="h-4 w-4" /> Map
-              </Button>
-            </div>
+      {tab === 'reasons' && <StoppageReasonsSettings />}
 
-            <div className="divide-y divide-border rounded-md border border-border">
-              {(pinsQ.data ?? []).length === 0 ? (
-                <p className="p-4 text-center text-sm text-muted-foreground">No pin mappings yet.</p>
-              ) : (
-                (pinsQ.data ?? []).map((m) => (
-                  <div key={m._id} className="flex items-center justify-between px-4 py-2">
-                    <div className="flex items-center gap-3"><Badge variant="outline">{m.pinId}</Badge><span className="text-foreground">{m.sensorId?.name ?? 'Unknown sensor'}</span></div>
-                    <Button variant="ghost" size="icon" aria-label="Remove mapping" onClick={() => delPinMut.mutate(m._id)}><Trash2 className="h-4 w-4 text-destructive" /></Button>
-                  </div>
-                ))
-              )}
-            </div>
-          </CardContent>
-        </Card>
+      {tab === 'alerts' && <AlertsSettings />}
+
+      {tab === 'pins' && (
+        <Section flush title="Pin mappings" description="Which PLC output pin each sensor is read from.">
+          <div className="flex flex-wrap items-end gap-3 border-b border-border px-5 py-4">
+            <Field label="Sensor" className="min-w-[180px] flex-1 sm:max-w-xs">
+              <Select value={pinForm.sensorId} onChange={(e) => setPinForm({ ...pinForm, sensorId: e.target.value })}>
+                <option value="">Select a sensor</option>
+                {(sensorsQ.data ?? []).map((s) => <option key={s._id} value={s._id}>{s.name}</option>)}
+              </Select>
+            </Field>
+            <Field label="Pin" className="w-36">
+              <Select value={pinForm.pinId} onChange={(e) => setPinForm({ ...pinForm, pinId: e.target.value })}>
+                <option value="">Select a pin</option>
+                {freePins.map((p) => <option key={p} value={p}>{p}</option>)}
+              </Select>
+            </Field>
+            <Button type="button" disabled={!pinForm.sensorId || !pinForm.pinId} loading={addPinMut.isPending} onClick={() => addPinMut.mutate(pinForm, { onSuccess: () => setPinForm({ sensorId: '', pinId: '' }) })}>
+              Add mapping
+            </Button>
+          </div>
+
+          {pinMappings.length === 0 ? (
+            <p className="px-5 py-6 text-[13px] text-muted-foreground">No pin mappings yet.</p>
+          ) : (
+            <ul className="divide-y divide-border">
+              {pinMappings.map((m) => (
+                <li key={m._id} className="flex items-center gap-4 px-5 py-1.5">
+                  <span className="w-16 shrink-0 font-mono text-[13px] text-foreground">{m.pinId}</span>
+                  <span className="min-w-0 flex-1 truncate text-sm text-foreground">{m.sensorId?.name ?? 'Unknown sensor'}</span>
+                  <IconButton label="Remove mapping" danger onClick={() => delPinMut.mutate(m._id)}>
+                    <Trash2 className="h-4 w-4" />
+                  </IconButton>
+                </li>
+              ))}
+            </ul>
+          )}
+        </Section>
       )}
     </div>
   );

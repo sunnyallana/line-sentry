@@ -7,3 +7,7 @@ export { Spinner, Skeleton, PageLoader, EmptyState } from './Feedback';
 export { Modal } from './Modal';
 export { DataTable, Pagination } from './Table';
 export type { Column } from './Table';
+export {
+  PageHeader, Section, Toolbar, StatStrip, Stat, Segmented, Tabs, StatusDot, IconButton, Field,
+  machineStatusLabel, formatNumber,
+} from './Page';

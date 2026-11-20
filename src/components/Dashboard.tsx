@@ -1,12 +1,15 @@
-import React from 'react';
-import { useNavigate } from 'react-router-dom';
+import React, { useMemo } from 'react';
+import { Link, useNavigate } from 'react-router-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { ChevronRight } from 'lucide-react';
 import { useAuth } from '../context/auth-context';
 import { useSocketEvent } from '../hooks/useSocketEvent';
 import apiService from '../services/api';
-import { Building2, Activity, TrendingUp, AlertTriangle, Users as UsersIcon, Gauge } from 'lucide-react';
-import { Card, PageLoader, EmptyState } from './ui';
+import {
+  Button, EmptyState, PageHeader, PageLoader, Section, Stat, StatStrip, StatusDot, formatNumber, machineStatusLabel,
+} from './ui';
 import { cn } from '../lib/cn';
+import { type FloorMachine, type FloorSnapshot, timeInState } from '../lib/floor';
 
 interface DashboardDept {
   _id: string;
@@ -23,32 +26,59 @@ interface FactoryStats {
   activeMachines: number;
 }
 
-const StatCard = ({
-  icon,
-  label,
-  value,
-  accent,
-  alert,
-}: {
-  icon: React.ReactNode;
-  label: string;
-  value: React.ReactNode;
-  accent: string;
-  alert?: boolean;
-}) => (
-  <Card className="p-6 transition-shadow hover:shadow-md">
-    <div className="flex items-center gap-4">
-      <div className={cn('flex h-12 w-12 items-center justify-center rounded-xl text-white', accent)}>{icon}</div>
-      <div>
-        <p className="text-sm font-medium text-muted-foreground">{label}</p>
-        <p className={cn('text-2xl font-bold', alert ? 'animate-pulse text-destructive' : 'text-foreground')}>{value}</p>
-      </div>
+type OverviewMachine = FloorMachine;
+
+interface RaisedAlert {
+  _id: string;
+  title: string;
+  message: string;
+  level: number;
+  machineId?: string | null;
+  at: string;
+  deliveries?: { channel: string; ok: boolean; error?: string | null }[];
+}
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+const clock = new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit' });
+
+const STATES = ['running', 'stoppage', 'stopped_yet_producing', 'inactive'] as const;
+type State = (typeof STATES)[number];
+
+const stateBar: Record<State, string> = {
+  running: 'bg-success',
+  stoppage: 'bg-destructive',
+  stopped_yet_producing: 'bg-warning',
+  inactive: 'bg-muted-foreground/30',
+};
+
+const deptIdOf = (m: OverviewMachine) => m.departmentId;
+const normalise = (status: string): State => ((STATES as readonly string[]).includes(status) ? (status as State) : 'inactive');
+
+const countStates = (machines: OverviewMachine[]) => {
+  const counts: Record<State, number> = { running: 0, stoppage: 0, stopped_yet_producing: 0, inactive: 0 };
+  machines.forEach((m) => { counts[normalise(m.status)] += 1; });
+  return counts;
+};
+
+/** How a group of machines is split across states, as one proportional bar. */
+const StateBar = ({ counts, total }: { counts: Record<State, number>; total: number }) => {
+  const summary = STATES.filter((s) => counts[s] > 0).map((s) => `${counts[s]} ${machineStatusLabel(s).toLowerCase()}`).join(', ');
+  return (
+    <div
+      className="flex h-1.5 w-full overflow-hidden rounded-full bg-muted"
+      role="img"
+      aria-label={total ? summary : 'No machines'}
+      title={total ? summary : 'No machines'}
+    >
+      {STATES.map((s) =>
+        counts[s] > 0 ? <span key={s} className={cn('h-full', stateBar[s])} style={{ width: `${(counts[s] / total) * 100}%` }} /> : null,
+      )}
     </div>
-  </Card>
-);
+  );
+};
 
 const Dashboard: React.FC = () => {
-  const { user, isOperator } = useAuth();
+  const { user, isOperator, isAdmin } = useAuth();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
 
@@ -60,7 +90,7 @@ const Dashboard: React.FC = () => {
   const departments = useQuery<DashboardDept[]>({
     queryKey: ['dashboard-departments'],
     queryFn: async () => {
-      const data: DashboardDept[] = await apiService.getDepartments(10);
+      const data: DashboardDept[] = await apiService.getDepartments(50);
       return Promise.all(
         data.map(async (d) => ({
           ...d,
@@ -70,121 +100,243 @@ const Dashboard: React.FC = () => {
     },
   });
 
-  // Realtime: invalidate the relevant queries (TanStack Query coalesces refetches,
-  // and useSocketEvent cleans up its own listener — no more refetch storm/leak).
-  const refreshAll = () => {
-    queryClient.invalidateQueries({ queryKey: ['factory-stats'] });
-    queryClient.invalidateQueries({ queryKey: ['dashboard-departments'] });
-  };
+  const floorQ = useQuery<FloorSnapshot>({
+    queryKey: ['floor'],
+    queryFn: () => apiService.getFloor(),
+    refetchInterval: 30_000,
+  });
+  const machinesQ = { data: floorQ.data?.machines, isLoading: floorQ.isLoading };
+  const alertsQ = useQuery<RaisedAlert[]>({
+    queryKey: ['alerts'],
+    queryFn: () => apiService.getAlerts(8),
+    refetchInterval: 60_000,
+  });
+
+  // Realtime. A state change is written straight into the cached machine list,
+  // so the page reacts at once; the heavier figures are refetched (TanStack
+  // Query coalesces those).
   const refreshFactory = () => queryClient.invalidateQueries({ queryKey: ['factory-stats'] });
-  useSocketEvent('production-update', refreshAll);
+  useSocketEvent('production-update', () => {
+    refreshFactory();
+    queryClient.invalidateQueries({ queryKey: ['dashboard-departments'] });
+    queryClient.invalidateQueries({ queryKey: ['floor'] });
+  });
   useSocketEvent('stoppage-added', refreshFactory);
   useSocketEvent('unclassified-stoppage-detected', refreshFactory);
-  useSocketEvent('machine-state-update', refreshFactory);
+  useSocketEvent('stoppage-resolved', refreshFactory);
+  useSocketEvent('machine-state-update', (e) => {
+    queryClient.setQueryData<FloorSnapshot>(['floor'], (old) =>
+      old && {
+        ...old,
+        machines: old.machines.map((m) =>
+          m._id === e.machineId && m.status !== e.status ? { ...m, status: e.status, statusSince: new Date().toISOString() } : m,
+        ),
+      },
+    );
+  });
 
-  if (departments.isLoading) {
-    return <PageLoader label="Loading dashboard…" />;
+  const depts = useMemo(() => departments.data ?? [], [departments.data]);
+  const machines = useMemo(() => {
+    const visible = new Set(depts.map((d) => d._id));
+    return (machinesQ.data ?? []).filter((m) => {
+      const dept = deptIdOf(m);
+      return dept ? visible.has(dept) : false;
+    });
+  }, [machinesQ.data, depts]);
+
+  if (departments.isLoading || machinesQ.isLoading) {
+    return <PageLoader label="Loading overview…" />;
   }
 
-  const stats: FactoryStats = factory.data ?? {
-    totalUnits: 0,
-    avgOEE: 0,
-    unclassifiedStoppages: 0,
-    activeMachines: 0,
-  };
-  const depts = departments.data ?? [];
-  const machineCount = depts.reduce((t, d) => t + (d.machineCount ?? 0), 0);
+  const stats: FactoryStats = factory.data ?? { totalUnits: 0, avgOEE: 0, unclassifiedStoppages: 0, activeMachines: 0 };
+  const totals = countStates(machines);
+  const stopped = machines.filter((m) => normalise(m.status) === 'stoppage');
+  const noPower = machines.filter((m) => normalise(m.status) === 'stopped_yet_producing');
+  const waiting = machines.filter((m) => m.waitingForReason && normalise(m.status) === 'running');
+  const attention = [...stopped, ...noPower, ...waiting];
+  const deptName = (m: OverviewMachine) => m.departmentName || depts.find((d) => d._id === deptIdOf(m))?.name || '';
+  const behind = machines.filter((m) => normalise(m.status) === 'running' && m.expectedSoFar >= 10 && m.unitsThisHour < m.expectedSoFar * 0.9);
+
+  const recentAlerts = (alertsQ.data ?? []).filter((a) => Date.now() - new Date(a.at).getTime() < DAY_MS);
+
+  const today = new Intl.DateTimeFormat(undefined, { weekday: 'long', day: 'numeric', month: 'long' }).format(new Date());
 
   return (
     <div className="space-y-6">
-      {/* Welcome header */}
-      <div className="rounded-xl bg-gradient-to-r from-primary to-info p-6 text-white shadow-lg">
-        <div className="flex items-center justify-between">
-          <div>
-            <h1 className="text-2xl font-bold">Welcome back, {user?.username}</h1>
-            <p className="mt-1 text-white/80">
-              {isOperator
-                ? `Monitoring ${user?.department?.name || 'your department'}`
-                : 'System overview and management'}
-            </p>
-          </div>
-          <div className="hidden items-center gap-2 text-white/80 sm:flex">
-            <UsersIcon className="h-5 w-5" />
-            <span className="capitalize">{user?.role}</span>
-          </div>
-        </div>
-      </div>
+      <PageHeader
+        title={isOperator ? user?.department?.name || 'Overview' : 'Overview'}
+        description={today}
+      />
 
-      {/* Quick stats */}
-      <div className={cn('grid grid-cols-1 gap-6', isOperator ? 'md:grid-cols-3' : 'md:grid-cols-4')}>
-        <StatCard icon={<Building2 className="h-6 w-6" />} label="Departments" value={depts.length} accent="bg-primary" />
-        <StatCard icon={<Activity className="h-6 w-6" />} label="Active Machines" value={machineCount} accent="bg-success" />
-        {!isOperator && (
-          <StatCard icon={<TrendingUp className="h-6 w-6" />} label="Avg OEE" value={`${stats.avgOEE}%`} accent="bg-warning" />
-        )}
-        <StatCard
-          icon={<AlertTriangle className="h-6 w-6" />}
-          label="Unclassified Stoppages"
-          value={stats.unclassifiedStoppages}
-          accent="bg-destructive"
-          alert={stats.unclassifiedStoppages > 0}
+      <StatStrip>
+        <Stat
+          label="Running now"
+          value={totals.running}
+          unit={`of ${machines.length}`}
+          hint={machines.length ? `${totals.inactive} idle` : 'No machines yet'}
         />
-      </div>
+        <Stat label="Units today" value={formatNumber(stats.totalUnits)} />
+        {!isOperator && <Stat label="Average OEE" value={stats.avgOEE} unit="%" hint="All departments, today" />}
+        <Stat
+          label="Stoppages to classify"
+          value={stats.unclassifiedStoppages}
+          tone={stats.unclassifiedStoppages > 0 ? 'bad' : 'neutral'}
+          hint={stats.unclassifiedStoppages > 0 ? 'Open the machine and pick a reason' : 'All classified'}
+        />
+      </StatStrip>
 
-      {/* Departments */}
-      <div>
-        <h2 className="mb-6 text-xl font-bold text-foreground">
-          {isOperator ? 'Your Department' : 'Departments Overview'}
-        </h2>
-
-        {depts.length === 0 ? (
-          <EmptyState
-            icon={<Building2 className="h-8 w-8" />}
-            title="No departments found"
-            description={
-              isOperator
-                ? 'You have not been assigned to a department yet. Contact your administrator.'
-                : 'Create your first department to begin monitoring factory operations.'
-            }
-          />
+      <Section
+        flush
+        title="Needs attention"
+        description={attention.length ? 'Stopped machines, unusual states, and stoppages with no reason recorded.' : undefined}
+      >
+        {attention.length === 0 ? (
+          <p className="px-5 py-6 text-[13px] text-muted-foreground">
+            {machines.length === 0 ? 'No machines are set up yet.' : 'Nothing right now. Every machine is running or idle.'}
+          </p>
         ) : (
-          <div className="grid grid-cols-1 gap-6 md:grid-cols-2 lg:grid-cols-3">
-            {depts.map((department) => (
-              <Card
-                key={department._id}
-                onClick={() => navigate(`/department/${department._id}`)}
-                className="group cursor-pointer p-6 transition-all hover:border-primary hover:shadow-xl"
-              >
-                <div className="mb-4 flex items-center justify-between">
-                  <h3 className="text-lg font-bold text-foreground">{department.name}</h3>
-                  <div className="rounded-lg bg-muted p-2 transition-colors group-hover:bg-primary">
-                    <Building2 className="h-5 w-5 text-primary transition-colors group-hover:text-primary-foreground" />
+          <ul className="divide-y divide-border">
+            {attention.map((m) => (
+              <li key={m._id}>
+                <Link
+                  to={`/machine/${m._id}`}
+                  className="group flex items-center gap-4 px-5 py-3 transition-colors duration-150 hover:bg-foreground/[0.03] focus-visible:ring-inset"
+                >
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate text-sm font-medium text-foreground">{m.name}</p>
+                    <p className="truncate text-xs text-muted-foreground">
+                      {deptName(m)}
+                      {m.waitingForReason && ` · stoppage at ${String(m.waitingForReason.hour).padStart(2, '0')}:00 has no reason`}
+                    </p>
                   </div>
-                </div>
-                <p className="mb-4 line-clamp-2 text-sm text-muted-foreground">
-                  {department.description || 'No description available'}
-                </p>
-                <dl className="space-y-3 text-sm">
-                  <div className="flex items-center justify-between">
-                    <dt className="font-medium text-muted-foreground">Machines</dt>
-                    <dd className="font-bold text-foreground">{department.machineCount ?? 0}</dd>
+                  {timeInState(m.statusSince) && (
+                    <span className="hidden text-xs text-muted-foreground sm:inline">{timeInState(m.statusSince)}</span>
+                  )}
+                  <StatusDot status={m.status} />
+                  <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground transition-transform duration-200 ease-spring group-hover:translate-x-0.5" />
+                </Link>
+              </li>
+            ))}
+          </ul>
+        )}
+      </Section>
+
+      {recentAlerts.length > 0 && (
+        <Section flush title="Alerts in the last 24 hours" description="Sent when a machine stays stopped with no reason recorded.">
+          <ul className="divide-y divide-border">
+            {recentAlerts.map((a) => {
+              const failed = (a.deliveries ?? []).filter((d) => !d.ok);
+              const row = (
+                <>
+                  <span className="tabular w-12 shrink-0 text-xs text-muted-foreground">{clock.format(new Date(a.at))}</span>
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate text-sm font-medium text-foreground">
+                      {a.title}
+                      {a.level >= 2 && <span className="ml-2 text-xs font-normal text-destructive">Escalated</span>}
+                    </p>
+                    <p className="truncate text-xs text-muted-foreground">
+                      {a.message}
+                      {failed.length > 0 && <span className="text-warning"> Not delivered by {failed.map((d) => d.channel).join(', ')}.</span>}
+                    </p>
                   </div>
-                  <div className="flex items-center justify-between">
-                    <dt className="font-medium text-muted-foreground">OEE</dt>
-                    <dd className="flex items-center gap-2 font-bold text-foreground">
-                      <Gauge className="h-4 w-4 text-warning" />
-                      {department.avgOEE != null ? `${department.avgOEE}%` : 'N/A'}
-                    </dd>
+                </>
+              );
+              return (
+                <li key={a._id}>
+                  {a.machineId ? (
+                    <Link to={`/machine/${a.machineId}`} className="group flex items-center gap-4 px-5 py-3 transition-colors duration-150 hover:bg-foreground/[0.03] focus-visible:ring-inset">
+                      {row}
+                      <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground transition-transform duration-200 ease-spring group-hover:translate-x-0.5" />
+                    </Link>
+                  ) : (
+                    <div className="flex items-center gap-4 px-5 py-3">{row}</div>
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+        </Section>
+      )}
+
+      {behind.length > 0 && (
+        <Section flush title="Behind this hour" description="Running, but more than 10% under what the mold should have made by now.">
+          <ul className="divide-y divide-border">
+            {behind.map((m) => (
+              <li key={m._id}>
+                <Link
+                  to={`/machine/${m._id}`}
+                  className="group flex items-center gap-4 px-5 py-3 transition-colors duration-150 hover:bg-foreground/[0.03] focus-visible:ring-inset"
+                >
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate text-sm font-medium text-foreground">{m.name}</p>
+                    <p className="truncate text-xs text-muted-foreground">{[deptName(m), m.moldName].filter(Boolean).join(' · ')}</p>
                   </div>
-                </dl>
-                <div className="mt-6 border-t border-border pt-4">
-                  <span className="text-sm font-semibold text-primary group-hover:underline">View details →</span>
-                </div>
-              </Card>
+                  <p className="tabular text-[13px] text-muted-foreground">
+                    <span className="font-medium text-warning">{formatNumber(m.unitsThisHour)}</span> of {formatNumber(m.expectedSoFar)} expected by now
+                  </p>
+                  <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground transition-transform duration-200 ease-spring group-hover:translate-x-0.5" />
+                </Link>
+              </li>
+            ))}
+          </ul>
+        </Section>
+      )}
+
+      <Section
+        flush
+        title={isOperator ? 'Your department' : 'Departments'}
+        actions={
+          <div className="hidden items-center gap-4 sm:flex">
+            {STATES.map((s) => (
+              <StatusDot key={s} status={s} className="text-xs text-muted-foreground" />
             ))}
           </div>
+        }
+      >
+        {depts.length === 0 ? (
+          <EmptyState
+            title="No departments yet"
+            description={
+              isOperator
+                ? 'You are not assigned to a department. Ask an administrator to assign you.'
+                : 'Create a department, then add its machines.'
+            }
+            action={isAdmin ? <Button onClick={() => navigate('/departments')}>Create a department</Button> : undefined}
+          />
+        ) : (
+          <ul className="divide-y divide-border">
+            {depts.map((d) => {
+              const own = machines.filter((m) => deptIdOf(m) === d._id);
+              const counts = countStates(own);
+              return (
+                <li key={d._id}>
+                  <Link
+                    to={`/department/${d._id}`}
+                    className="group grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-6 gap-y-2 px-5 py-3.5 transition-colors duration-150 hover:bg-foreground/[0.03] focus-visible:ring-inset sm:grid-cols-[minmax(0,1.4fr)_minmax(0,1fr)_5rem_1rem]"
+                  >
+                    <div className="min-w-0">
+                      <p className="truncate text-sm font-medium text-foreground">{d.name}</p>
+                      <p className="truncate text-xs text-muted-foreground">
+                        {own.length === 0
+                          ? 'No machines'
+                          : `${counts.running} of ${own.length} running${counts.stoppage ? ` · ${counts.stoppage} stopped` : ''}`}
+                      </p>
+                    </div>
+                    <div className="col-span-2 row-start-2 sm:col-span-1 sm:row-start-auto">
+                      <StateBar counts={counts} total={own.length} />
+                    </div>
+                    <div className="tabular row-start-1 text-right sm:row-start-auto">
+                      <p className="text-sm font-medium text-foreground">{d.avgOEE != null ? `${d.avgOEE}%` : '–'}</p>
+                      <p className="text-xs text-muted-foreground">OEE</p>
+                    </div>
+                    <ChevronRight className="hidden h-4 w-4 text-muted-foreground transition-transform duration-200 ease-spring group-hover:translate-x-0.5 sm:block" />
+                  </Link>
+                </li>
+              );
+            })}
+          </ul>
         )}
-      </div>
+      </Section>
     </div>
   );
 };

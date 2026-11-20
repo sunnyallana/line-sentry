@@ -4,12 +4,13 @@ import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { toast } from 'react-toastify';
-import { PackageOpen, Plus, Edit, Trash2, Power, PowerOff, Search } from 'lucide-react';
+import { Plus, Edit, Trash2, Power, PowerOff, Search } from 'lucide-react';
 import apiService from '../services/api';
 import type { Mold, Department } from '../types';
 import { useDataTable } from '../hooks/useDataTable';
 import {
-  Button, Input, Label, Select, Badge, Card, Modal, DataTable, Pagination, EmptyState, type Column,
+  Button, Input, Select, Modal, DataTable, Pagination, EmptyState, PageHeader, PageLoader, Section, Toolbar,
+  StatusDot, IconButton, Field, formatNumber, type Column,
 } from './ui';
 
 const schema = z.object({
@@ -19,6 +20,12 @@ const schema = z.object({
   departmentId: z.string().nonempty('Department is required'),
 });
 type FormData = z.infer<typeof schema>;
+
+const textareaClass = [
+  'flex w-full rounded-md border border-input bg-card px-3 py-2 text-sm text-foreground',
+  'transition-[border-color,box-shadow] duration-150 ease-out hover:border-foreground/30',
+  'focus-visible:border-primary focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-primary/20',
+].join(' ');
 
 const errMsg = (e: unknown, fallback: string) => (e instanceof Error ? e.message : fallback);
 type Pop = { _id: string; name: string };
@@ -69,46 +76,59 @@ const Molds: React.FC = () => {
       invalidate();
       setEditing(null);
     },
-    onError: (e) => toast.error(errMsg(e, 'Save failed')),
+    onError: (e) => toast.error(errMsg(e, 'Could not save mold')),
   });
   const toggleMut = useMutation({
     mutationFn: (m: Mold) => apiService.toggleMoldStatus(m._id),
-    onSuccess: () => { toast.success('Status updated'); invalidate(); },
-    onError: (e) => toast.error(errMsg(e, 'Update failed')),
+    onSuccess: (_data, m) => { toast.success(m.isActive ? 'Mold deactivated' : 'Mold activated'); invalidate(); },
+    onError: (e) => toast.error(errMsg(e, 'Could not update mold')),
   });
   const deleteMut = useMutation({
     mutationFn: (id: string) => apiService.deleteMold(id),
     onSuccess: () => { toast.success('Mold deleted'); invalidate(); },
-    onError: (e) => toast.error(errMsg(e, 'Delete failed')),
+    onError: (e) => toast.error(errMsg(e, 'Could not delete mold')),
   });
   const onDelete = (m: Mold) => {
-    if (window.confirm('Delete this mold? This cannot be undone.')) deleteMut.mutate(m._id);
+    if (window.confirm(`Delete mold "${m.name}"? Its capacity setting is removed and cannot be recovered.`)) {
+      deleteMut.mutate(m._id);
+    }
+  };
+
+  const hasFilters = Boolean(table.searchInput || table.filters.department || table.filters.isActive);
+  const clearFilters = () => {
+    table.setSearch('');
+    table.setFilter('department', '');
+    table.setFilter('isActive', '');
   };
 
   const columns: Column<Mold>[] = [
     { key: 'name', header: 'Mold', render: (m) => (
-      <div className="flex items-center gap-3">
-        <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-primary/15 text-primary">
-          <PackageOpen className="h-5 w-5" />
-        </div>
-        <span className="font-medium text-foreground">{m.name}</span>
+      <div className="min-w-0">
+        <div className="font-medium">{m.name}</div>
+        {m.description && <div className="max-w-xs truncate text-[13px] text-muted-foreground">{m.description}</div>}
       </div>
     ) },
-    { key: 'department', header: 'Department', render: (m) => deptOf(m)?.name ?? '—' },
-    { key: 'productionCapacityPerHour', header: 'Capacity', sortable: true, render: (m) =>
-      `${m.productionCapacityPerHour} /hr` },
+    { key: 'department', header: 'Department', render: (m) => deptOf(m)?.name ?? <span className="text-muted-foreground">–</span> },
+    { key: 'productionCapacityPerHour', header: 'Capacity (units/hour)', sortable: true, className: 'text-right tabular-nums', render: (m) =>
+      formatNumber(m.productionCapacityPerHour) },
     { key: 'status', header: 'Status', render: (m) => (
-      <Badge variant={m.isActive ? 'success' : 'muted'}>{m.isActive ? 'Active' : 'Inactive'}</Badge>
+      <StatusDot status={m.isActive ? 'running' : 'inactive'} label={m.isActive ? 'Active' : 'Inactive'} />
     ) },
     {
-      key: 'actions', header: '', className: 'text-right',
+      key: 'actions', header: <span className="sr-only">Actions</span>, className: 'text-right',
       render: (m) => (
         <div className="flex justify-end gap-1">
-          <Button variant="ghost" size="icon" aria-label="Edit" onClick={() => openEdit(m)}><Edit className="h-4 w-4" /></Button>
-          <Button variant="ghost" size="icon" aria-label={m.isActive ? 'Deactivate' : 'Activate'} onClick={() => toggleMut.mutate(m)}>
-            {m.isActive ? <PowerOff className="h-4 w-4 text-warning" /> : <Power className="h-4 w-4 text-success" />}
-          </Button>
-          <Button variant="ghost" size="icon" aria-label="Delete" onClick={() => onDelete(m)}><Trash2 className="h-4 w-4 text-destructive" /></Button>
+          <IconButton label={`Edit ${m.name}`} onClick={() => openEdit(m)}><Edit className="h-4 w-4" /></IconButton>
+          <IconButton
+            label={`${m.isActive ? 'Deactivate' : 'Activate'} ${m.name}`}
+            disabled={toggleMut.isPending && toggleMut.variables?._id === m._id}
+            onClick={() => toggleMut.mutate(m)}
+          >
+            {m.isActive ? <PowerOff className="h-4 w-4" /> : <Power className="h-4 w-4" />}
+          </IconButton>
+          <IconButton label={`Delete ${m.name}`} danger onClick={() => onDelete(m)}>
+            <Trash2 className="h-4 w-4" />
+          </IconButton>
         </div>
       ),
     },
@@ -116,75 +136,101 @@ const Molds: React.FC = () => {
 
   return (
     <div className="space-y-6">
-      <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
-        <div>
-          <h1 className="text-2xl font-bold text-foreground">Molds</h1>
-          <p className="text-muted-foreground">Define molds and their ideal production capacity</p>
-        </div>
-        <div className="flex flex-wrap items-center gap-3">
-          <Input
-            className="w-full sm:w-64" placeholder="Search molds…" icon={<Search className="h-4 w-4" />}
-            value={table.searchInput} onChange={(e) => table.setSearch(e.target.value)}
-          />
-          <Select className="w-44" value={table.filters.department ?? ''} onChange={(e) => table.setFilter('department', e.target.value)}>
-            <option value="">All departments</option>
-            {(departments.data ?? []).map((d) => <option key={d._id} value={d._id}>{d.name}</option>)}
-          </Select>
-          <Select className="w-36" value={table.filters.isActive ?? ''} onChange={(e) => table.setFilter('isActive', e.target.value)}>
-            <option value="">All status</option>
-            <option value="true">Active</option>
-            <option value="false">Inactive</option>
-          </Select>
-          <Button onClick={openCreate}><Plus className="h-4 w-4" /> New Mold</Button>
-        </div>
-      </div>
+      <PageHeader
+        title="Molds"
+        description="Each mold's ideal output per hour, used to measure performance."
+        actions={<Button onClick={openCreate}><Plus className="h-4 w-4" /> New mold</Button>}
+      />
 
-      <Card className="p-4">
-        <DataTable
-          columns={columns}
-          rows={table.items}
-          rowKey={(m) => m._id}
-          onSort={table.toggleSort}
-          empty={<EmptyState icon={<PackageOpen className="h-8 w-8" />} title="No molds found" description="Create a mold to enable performance/OEE calculations." action={<Button onClick={openCreate}><Plus className="h-4 w-4" /> New Mold</Button>} />}
-        />
+      <Section flush>
+        <div className="border-b border-border px-5 py-3">
+          <Toolbar>
+            <Input
+              className="w-64"
+              aria-label="Search molds"
+              placeholder="Search molds"
+              icon={<Search className="h-4 w-4" />}
+              value={table.searchInput}
+              onChange={(e) => table.setSearch(e.target.value)}
+            />
+            <Select className="w-44" aria-label="Filter by department" value={table.filters.department ?? ''} onChange={(e) => table.setFilter('department', e.target.value)}>
+              <option value="">All departments</option>
+              {(departments.data ?? []).map((d) => <option key={d._id} value={d._id}>{d.name}</option>)}
+            </Select>
+            <Select className="w-40" aria-label="Filter by status" value={table.filters.isActive ?? ''} onChange={(e) => table.setFilter('isActive', e.target.value)}>
+              <option value="">All statuses</option>
+              <option value="true">Active</option>
+              <option value="false">Inactive</option>
+            </Select>
+          </Toolbar>
+        </div>
+
+        {table.isLoading ? (
+          <PageLoader />
+        ) : table.isError ? (
+          <EmptyState
+            title="Molds could not be loaded"
+            description="Check your connection and try again."
+            action={<Button variant="outline" onClick={() => table.refetch()}>Try again</Button>}
+          />
+        ) : (
+          <DataTable
+            columns={columns}
+            rows={table.items}
+            rowKey={(m) => m._id}
+            onSort={table.toggleSort}
+            empty={hasFilters ? (
+              <EmptyState
+                title="No molds match these filters."
+                action={<Button variant="outline" onClick={clearFilters}>Clear filters</Button>}
+              />
+            ) : (
+              <EmptyState
+                title="No molds yet"
+                description="Create a mold so performance and OEE can be calculated against its capacity."
+                action={<Button onClick={openCreate}><Plus className="h-4 w-4" /> New mold</Button>}
+              />
+            )}
+          />
+        )}
         <Pagination page={table.pagination?.currentPage ?? 1} totalPages={table.pagination?.totalPages ?? 1} onPage={table.setPage} />
-      </Card>
+      </Section>
 
       <Modal
         open={editing !== null}
         onClose={() => setEditing(null)}
-        title={editing === 'new' ? 'Create mold' : 'Edit mold'}
+        title={editing === 'new' ? 'New mold' : 'Edit mold'}
         footer={
           <>
             <Button variant="outline" onClick={() => setEditing(null)}>Cancel</Button>
-            <Button form="mold-form" type="submit" loading={isSubmitting || saveMut.isPending}>{editing === 'new' ? 'Create' : 'Save'}</Button>
+            <Button form="mold-form" type="submit" loading={isSubmitting || saveMut.isPending}>
+              {editing === 'new' ? 'Create mold' : 'Save changes'}
+            </Button>
           </>
         }
       >
         <form id="mold-form" className="space-y-4" onSubmit={handleSubmit((d) => saveMut.mutate(d))}>
-          <div>
-            <Label htmlFor="name">Mold name *</Label>
-            <Input id="name" {...register('name')} />
-            {errors.name && <p className="mt-1 text-sm text-destructive">{errors.name.message}</p>}
+          <Field label="Name" error={errors.name?.message}>
+            <Input {...register('name')} />
+          </Field>
+          <div className="grid gap-4 sm:grid-cols-2">
+            <Field
+              label="Capacity"
+              hint="Ideal units per hour."
+              error={errors.productionCapacityPerHour?.message}
+            >
+              <Input type="number" min={1} inputMode="numeric" {...register('productionCapacityPerHour', { valueAsNumber: true })} />
+            </Field>
+            <Field label="Department" error={errors.departmentId?.message}>
+              <Select {...register('departmentId')}>
+                <option value="">Select a department</option>
+                {(departments.data ?? []).map((d) => <option key={d._id} value={d._id}>{d.name}</option>)}
+              </Select>
+            </Field>
           </div>
-          <div>
-            <Label htmlFor="capacity">Production capacity (units/hour) *</Label>
-            <Input id="capacity" type="number" min={1} {...register('productionCapacityPerHour', { valueAsNumber: true })} />
-            {errors.productionCapacityPerHour && <p className="mt-1 text-sm text-destructive">{errors.productionCapacityPerHour.message}</p>}
-          </div>
-          <div>
-            <Label htmlFor="departmentId">Department *</Label>
-            <Select id="departmentId" {...register('departmentId')}>
-              <option value="">Select a department…</option>
-              {(departments.data ?? []).map((d) => <option key={d._id} value={d._id}>{d.name}</option>)}
-            </Select>
-            {errors.departmentId && <p className="mt-1 text-sm text-destructive">{errors.departmentId.message}</p>}
-          </div>
-          <div>
-            <Label htmlFor="description">Description</Label>
-            <textarea id="description" rows={3} className="flex w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring" {...register('description')} />
-            {errors.description && <p className="mt-1 text-sm text-destructive">{errors.description.message}</p>}
-          </div>
+          <Field label="Description" hint="Optional. Up to 200 characters." error={errors.description?.message}>
+            <textarea rows={3} className={textareaClass} {...register('description')} />
+          </Field>
         </form>
       </Modal>
     </div>

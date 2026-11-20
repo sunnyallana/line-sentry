@@ -4,13 +4,14 @@ import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { toast } from 'react-toastify';
-import { User as UserIcon, Plus, Edit, Trash2, Power, PowerOff, Search } from 'lucide-react';
+import { Plus, Edit, Trash2, Power, PowerOff, Search } from 'lucide-react';
 import { useAuth } from '../context/auth-context';
 import apiService from '../services/api';
 import type { Department } from '../types';
 import { useDataTable } from '../hooks/useDataTable';
 import {
-  Button, Input, Label, Select, Badge, Card, Modal, DataTable, Pagination, EmptyState, type Column,
+  Button, Input, Select, Modal, DataTable, Pagination, EmptyState, PageHeader, PageLoader, Section, Toolbar,
+  StatusDot, IconButton, Field, type Column,
 } from './ui';
 
 const schema = z.object({
@@ -30,6 +31,8 @@ interface UserRow {
   isActive: boolean;
   departmentId?: { _id: string; name: string } | string | null;
 }
+
+const ROLE_LABELS: Record<UserRow['role'], string> = { admin: 'Administrator', operator: 'Operator' };
 
 const errMsg = (e: unknown, fallback: string) => (e instanceof Error ? e.message : fallback);
 const deptName = (u: UserRow) => (u.departmentId && typeof u.departmentId === 'object' ? u.departmentId.name : '');
@@ -90,19 +93,25 @@ const Users: React.FC = () => {
       invalidate();
       setEditing(null);
     },
-    onError: (e) => toast.error(errMsg(e, 'Save failed')),
+    onError: (e) => toast.error(errMsg(e, 'Could not save user')),
   });
 
   const toggleMut = useMutation({
     mutationFn: (u: UserRow) => apiService.updateUser(u._id, { isActive: !u.isActive }),
-    onSuccess: () => { toast.success('Status updated'); invalidate(); },
-    onError: (e) => toast.error(errMsg(e, 'Update failed')),
+    onSuccess: (_data, u) => { toast.success(u.isActive ? 'User deactivated' : 'User activated'); invalidate(); },
+    onError: (e) => toast.error(errMsg(e, 'Could not update user')),
   });
   const deleteMut = useMutation({
     mutationFn: (id: string) => apiService.deleteUser(id),
     onSuccess: () => { toast.success('User deleted'); invalidate(); },
-    onError: (e) => toast.error(errMsg(e, 'Delete failed')),
+    onError: (e) => toast.error(errMsg(e, 'Could not delete user')),
   });
+
+  const onDelete = (u: UserRow) => {
+    if (window.confirm(`Delete user "${u.username}"? Their account is removed and they can no longer sign in. This cannot be undone.`)) {
+      deleteMut.mutate(u._id);
+    }
+  };
 
   const onSubmit = handleSubmit((data) => {
     if (data.role === 'operator' && !data.departmentId) {
@@ -118,41 +127,45 @@ const Users: React.FC = () => {
 
   const isSelf = (u: UserRow) => me?.id === u._id;
 
+  const hasFilters = Boolean(table.searchInput || table.filters.role || table.filters.isActive);
+  const clearFilters = () => {
+    table.setSearch('');
+    table.setFilter('role', '');
+    table.setFilter('isActive', '');
+  };
+
   const columns: Column<UserRow>[] = [
     { key: 'username', header: 'User', sortable: true, render: (u) => (
-      <div className="flex items-center gap-3">
-        <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-primary/15 text-primary">
-          <UserIcon className="h-5 w-5" />
+      <div className="min-w-0">
+        <div className="font-medium">
+          {u.username}
+          {isSelf(u) && <span className="ml-1.5 font-normal text-muted-foreground">(you)</span>}
         </div>
-        <span className="font-medium text-foreground">{u.username}</span>
+        <div className="truncate text-[13px] text-muted-foreground">{u.email}</div>
       </div>
     ) },
-    { key: 'email', header: 'Email', render: (u) => <span className="text-muted-foreground">{u.email}</span> },
-    { key: 'role', header: 'Role', render: (u) => (
-      <Badge variant={u.role === 'admin' ? 'info' : 'muted'} className="capitalize">{u.role}</Badge>
-    ) },
-    { key: 'department', header: 'Department', render: (u) => deptName(u) || '—' },
+    { key: 'role', header: 'Role', render: (u) => ROLE_LABELS[u.role] ?? u.role },
+    { key: 'department', header: 'Department', render: (u) => deptName(u) || <span className="text-muted-foreground">–</span> },
     { key: 'status', header: 'Status', render: (u) => (
-      <Badge variant={u.isActive ? 'success' : 'muted'}>{u.isActive ? 'Active' : 'Inactive'}</Badge>
+      <StatusDot status={u.isActive ? 'running' : 'inactive'} label={u.isActive ? 'Active' : 'Inactive'} />
     ) },
     {
-      key: 'actions', header: '', className: 'text-right',
+      key: 'actions', header: <span className="sr-only">Actions</span>, className: 'text-right',
       render: (u) => (
         <div className="flex justify-end gap-1">
-          <Button variant="ghost" size="icon" aria-label="Edit" onClick={() => openEdit(u)}><Edit className="h-4 w-4" /></Button>
+          <IconButton label={`Edit ${u.username}`} onClick={() => openEdit(u)}><Edit className="h-4 w-4" /></IconButton>
           {!isSelf(u) && (
             <>
-              <Button variant="ghost" size="icon" aria-label={u.isActive ? 'Deactivate' : 'Activate'} onClick={() => toggleMut.mutate(u)}>
-                {u.isActive ? <PowerOff className="h-4 w-4 text-warning" /> : <Power className="h-4 w-4 text-success" />}
-              </Button>
-              <Button
-                variant="ghost"
-                size="icon"
-                aria-label="Delete"
-                onClick={() => window.confirm('Delete this user?') && deleteMut.mutate(u._id)}
+              <IconButton
+                label={`${u.isActive ? 'Deactivate' : 'Activate'} ${u.username}`}
+                disabled={toggleMut.isPending && toggleMut.variables?._id === u._id}
+                onClick={() => toggleMut.mutate(u)}
               >
-                <Trash2 className="h-4 w-4 text-destructive" />
-              </Button>
+                {u.isActive ? <PowerOff className="h-4 w-4" /> : <Power className="h-4 w-4" />}
+              </IconButton>
+              <IconButton label={`Delete ${u.username}`} danger onClick={() => onDelete(u)}>
+                <Trash2 className="h-4 w-4" />
+              </IconButton>
             </>
           )}
         </div>
@@ -162,84 +175,110 @@ const Users: React.FC = () => {
 
   return (
     <div className="space-y-6">
-      <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
-        <div>
-          <h1 className="text-2xl font-bold text-foreground">Users</h1>
-          <p className="text-muted-foreground">Manage accounts and role-based access</p>
-        </div>
-        <div className="flex flex-wrap items-center gap-3">
-          <Input className="w-full sm:w-64" placeholder="Search users…" icon={<Search className="h-4 w-4" />} value={table.searchInput} onChange={(e) => table.setSearch(e.target.value)} />
-          <Select className="w-36" value={table.filters.role ?? ''} onChange={(e) => table.setFilter('role', e.target.value)}>
-            <option value="">All roles</option>
-            <option value="admin">Admin</option>
-            <option value="operator">Operator</option>
-          </Select>
-          <Select className="w-36" value={table.filters.isActive ?? ''} onChange={(e) => table.setFilter('isActive', e.target.value)}>
-            <option value="">All status</option>
-            <option value="true">Active</option>
-            <option value="false">Inactive</option>
-          </Select>
-          <Button onClick={openCreate}><Plus className="h-4 w-4" /> New User</Button>
-        </div>
-      </div>
+      <PageHeader
+        title="Users"
+        description="People who can sign in, and what each of them can see."
+        actions={<Button onClick={openCreate}><Plus className="h-4 w-4" /> New user</Button>}
+      />
 
-      <Card className="p-4">
-        <DataTable
-          columns={columns}
-          rows={table.items}
-          rowKey={(u) => u._id}
-          onSort={table.toggleSort}
-          empty={<EmptyState icon={<UserIcon className="h-8 w-8" />} title="No users found" action={<Button onClick={openCreate}><Plus className="h-4 w-4" /> New User</Button>} />}
-        />
+      <Section flush>
+        <div className="border-b border-border px-5 py-3">
+          <Toolbar>
+            <Input
+              className="w-64"
+              aria-label="Search users"
+              placeholder="Search users"
+              icon={<Search className="h-4 w-4" />}
+              value={table.searchInput}
+              onChange={(e) => table.setSearch(e.target.value)}
+            />
+            <Select className="w-40" aria-label="Filter by role" value={table.filters.role ?? ''} onChange={(e) => table.setFilter('role', e.target.value)}>
+              <option value="">All roles</option>
+              <option value="admin">Administrator</option>
+              <option value="operator">Operator</option>
+            </Select>
+            <Select className="w-40" aria-label="Filter by status" value={table.filters.isActive ?? ''} onChange={(e) => table.setFilter('isActive', e.target.value)}>
+              <option value="">All statuses</option>
+              <option value="true">Active</option>
+              <option value="false">Inactive</option>
+            </Select>
+          </Toolbar>
+        </div>
+
+        {table.isLoading ? (
+          <PageLoader />
+        ) : table.isError ? (
+          <EmptyState
+            title="Users could not be loaded"
+            description="Check your connection and try again."
+            action={<Button variant="outline" onClick={() => table.refetch()}>Try again</Button>}
+          />
+        ) : (
+          <DataTable
+            columns={columns}
+            rows={table.items}
+            rowKey={(u) => u._id}
+            onSort={table.toggleSort}
+            empty={hasFilters ? (
+              <EmptyState
+                title="No users match these filters."
+                action={<Button variant="outline" onClick={clearFilters}>Clear filters</Button>}
+              />
+            ) : (
+              <EmptyState
+                title="No users yet"
+                description="Create an account for each person who needs to sign in."
+                action={<Button onClick={openCreate}><Plus className="h-4 w-4" /> New user</Button>}
+              />
+            )}
+          />
+        )}
         <Pagination page={table.pagination?.currentPage ?? 1} totalPages={table.pagination?.totalPages ?? 1} onPage={table.setPage} />
-      </Card>
+      </Section>
 
       <Modal
         open={editing !== null}
         onClose={() => setEditing(null)}
-        title={editing === 'new' ? 'Create user' : 'Edit user'}
+        title={editing === 'new' ? 'New user' : 'Edit user'}
         footer={
           <>
             <Button variant="outline" onClick={() => setEditing(null)}>Cancel</Button>
-            <Button form="user-form" type="submit" loading={isSubmitting || saveMut.isPending}>{editing === 'new' ? 'Create' : 'Save'}</Button>
+            <Button form="user-form" type="submit" loading={isSubmitting || saveMut.isPending}>
+              {editing === 'new' ? 'Create user' : 'Save changes'}
+            </Button>
           </>
         }
       >
         <form id="user-form" className="space-y-4" onSubmit={onSubmit}>
-          <div>
-            <Label htmlFor="username">Username *</Label>
-            <Input id="username" {...register('username')} />
-            {errors.username && <p className="mt-1 text-sm text-destructive">{errors.username.message}</p>}
-          </div>
-          <div>
-            <Label htmlFor="email">Email *</Label>
-            <Input id="email" type="email" {...register('email')} />
-            {errors.email && <p className="mt-1 text-sm text-destructive">{errors.email.message}</p>}
-          </div>
-          <div className="grid grid-cols-2 gap-4">
-            <div>
-              <Label htmlFor="role">Role *</Label>
-              <Select id="role" {...register('role')}>
+          <Field label="Username" hint="3 to 30 characters. Used to sign in." error={errors.username?.message}>
+            <Input autoComplete="off" {...register('username')} />
+          </Field>
+          <Field label="Email" error={errors.email?.message}>
+            <Input type="email" autoComplete="off" {...register('email')} />
+          </Field>
+          <div className="grid gap-4 sm:grid-cols-2">
+            <Field label="Role" hint={role === 'admin' ? 'Has access to every department and the admin screens.' : 'Works within one department.'}>
+              <Select {...register('role')}>
                 <option value="operator">Operator</option>
-                <option value="admin">Admin</option>
+                <option value="admin">Administrator</option>
               </Select>
-            </div>
+            </Field>
             {role === 'operator' && (
-              <div>
-                <Label htmlFor="departmentId">Department *</Label>
-                <Select id="departmentId" {...register('departmentId')}>
-                  <option value="">Select…</option>
+              <Field label="Department" error={errors.departmentId?.message}>
+                <Select {...register('departmentId')}>
+                  <option value="">Select a department</option>
                   {(departments.data ?? []).map((d) => <option key={d._id} value={d._id}>{d.name}</option>)}
                 </Select>
-              </div>
+              </Field>
             )}
           </div>
-          {errors.departmentId && <p className="-mt-2 text-sm text-destructive">{errors.departmentId.message}</p>}
-          <div>
-            <Label htmlFor="password">{editing === 'new' ? 'Password *' : 'Password (leave blank to keep)'}</Label>
-            <Input id="password" type="password" autoComplete="new-password" {...register('password')} />
-            {errors.password && <p className="mt-1 text-sm text-destructive">{errors.password.message}</p>}
-          </div>
+          <Field
+            label={editing === 'new' ? 'Password' : 'New password'}
+            hint={editing === 'new' ? 'At least 6 characters.' : 'Leave blank to keep the current password.'}
+            error={errors.password?.message}
+          >
+            <Input type="password" autoComplete="new-password" {...register('password')} />
+          </Field>
         </form>
       </Modal>
     </div>

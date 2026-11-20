@@ -4,11 +4,12 @@ import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { toast } from 'react-toastify';
-import { Cpu, Plus, Edit, Trash2, Power, PowerOff, Search } from 'lucide-react';
+import { Plus, Edit, Trash2, Power, PowerOff, Search } from 'lucide-react';
 import apiService from '../services/api';
 import { useDataTable } from '../hooks/useDataTable';
 import {
-  Button, Input, Label, Select, Badge, Card, Modal, DataTable, Pagination, EmptyState, type Column,
+  Button, Input, Select, Modal, DataTable, Pagination, EmptyState, PageHeader, PageLoader, Section, Toolbar,
+  StatusDot, IconButton, Field, type Column,
 } from './ui';
 
 const SENSOR_TYPES = ['power', 'unit-cycle', 'temperature', 'pressure', 'vibration'] as const;
@@ -32,9 +33,23 @@ interface SensorRow {
   machineId?: { _id: string; name: string; departmentId?: { _id: string; name: string } } | string;
 }
 
+const textareaClass = [
+  'flex w-full rounded-md border border-input bg-card px-3 py-2 text-sm text-foreground',
+  'transition-[border-color,box-shadow] duration-150 ease-out hover:border-foreground/30',
+  'focus-visible:border-primary focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-primary/20',
+].join(' ');
+
 const errMsg = (e: unknown, fallback: string) => (e instanceof Error ? e.message : fallback);
 const machineOf = (s: SensorRow) =>
   s.machineId && typeof s.machineId === 'object' ? s.machineId : null;
+
+/** 'unit-cycle' -> 'Unit cycle' */
+const typeLabel = (type: string) => {
+  const words = type.replace(/[-_]/g, ' ');
+  return words.charAt(0).toUpperCase() + words.slice(1);
+};
+
+const dash = <span className="text-muted-foreground">–</span>;
 
 const Sensors: React.FC = () => {
   const queryClient = useQueryClient();
@@ -85,49 +100,65 @@ const Sensors: React.FC = () => {
       invalidate();
       setEditing(null);
     },
-    onError: (e) => toast.error(errMsg(e, 'Save failed')),
+    onError: (e) => toast.error(errMsg(e, 'Could not save sensor')),
   });
   const toggleMut = useMutation({
     mutationFn: (s: SensorRow) => apiService.updateSensor(s._id, { isActive: !s.isActive }),
-    onSuccess: () => { toast.success('Status updated'); invalidate(); },
-    onError: (e) => toast.error(errMsg(e, 'Update failed')),
+    onSuccess: (_data, s) => { toast.success(s.isActive ? 'Sensor deactivated' : 'Sensor activated'); invalidate(); },
+    onError: (e) => toast.error(errMsg(e, 'Could not update sensor')),
   });
   const deleteMut = useMutation({
     mutationFn: (id: string) => apiService.deleteSensor(id),
     onSuccess: () => { toast.success('Sensor deleted'); invalidate(); },
-    onError: (e) => toast.error(errMsg(e, 'Delete failed')),
+    onError: (e) => toast.error(errMsg(e, 'Could not delete sensor')),
   });
+
+  const onDelete = (s: SensorRow) => {
+    const machine = machineOf(s)?.name;
+    const where = machine ? ` from ${machine}` : '';
+    if (window.confirm(`Delete sensor "${s.name}"${where}? Its configuration is removed and cannot be recovered.`)) {
+      deleteMut.mutate(s._id);
+    }
+  };
+
+  const hasFilters = Boolean(
+    table.searchInput || table.filters.department || table.filters.sensorType || table.filters.status,
+  );
+  const clearFilters = () => {
+    table.setSearch('');
+    table.setFilter('department', '');
+    table.setFilter('sensorType', '');
+    table.setFilter('status', '');
+  };
 
   const columns: Column<SensorRow>[] = [
     { key: 'name', header: 'Sensor', sortable: true, render: (s) => (
-      <div className="flex items-center gap-3">
-        <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-primary/15 text-primary">
-          <Cpu className="h-5 w-5" />
-        </div>
-        <span className="font-medium text-foreground">{s.name}</span>
+      <div className="min-w-0">
+        <div className="font-medium">{s.name}</div>
+        {s.description && <div className="max-w-xs truncate text-[13px] text-muted-foreground">{s.description}</div>}
       </div>
     ) },
-    { key: 'machine', header: 'Machine', render: (s) => machineOf(s)?.name ?? '—' },
-    { key: 'department', header: 'Department', render: (s) => machineOf(s)?.departmentId?.name ?? '—' },
-    { key: 'sensorType', header: 'Type', render: (s) => (
-      <Badge variant={s.sensorType === 'power' ? 'info' : s.sensorType === 'unit-cycle' ? 'success' : 'muted'}>
-        {s.sensorType}
-      </Badge>
-    ) },
+    { key: 'machine', header: 'Machine', render: (s) => machineOf(s)?.name ?? dash },
+    { key: 'department', header: 'Department', render: (s) => machineOf(s)?.departmentId?.name ?? dash },
+    { key: 'sensorType', header: 'Type', render: (s) => typeLabel(s.sensorType) },
     { key: 'status', header: 'Status', render: (s) => (
-      <Badge variant={s.isActive ? 'success' : 'muted'}>{s.isActive ? 'Active' : 'Inactive'}</Badge>
+      <StatusDot status={s.isActive ? 'running' : 'inactive'} label={s.isActive ? 'Active' : 'Inactive'} />
     ) },
     {
-      key: 'actions', header: '', className: 'text-right',
+      key: 'actions', header: <span className="sr-only">Actions</span>, className: 'text-right',
       render: (s) => (
         <div className="flex justify-end gap-1">
-          <Button variant="ghost" size="icon" aria-label="Edit" onClick={() => openEdit(s)}><Edit className="h-4 w-4" /></Button>
-          <Button variant="ghost" size="icon" aria-label={s.isActive ? 'Deactivate' : 'Activate'} onClick={() => toggleMut.mutate(s)}>
-            {s.isActive ? <PowerOff className="h-4 w-4 text-warning" /> : <Power className="h-4 w-4 text-success" />}
-          </Button>
-          <Button variant="ghost" size="icon" aria-label="Delete" onClick={() => window.confirm('Delete this sensor?') && deleteMut.mutate(s._id)}>
-            <Trash2 className="h-4 w-4 text-destructive" />
-          </Button>
+          <IconButton label={`Edit ${s.name}`} onClick={() => openEdit(s)}><Edit className="h-4 w-4" /></IconButton>
+          <IconButton
+            label={`${s.isActive ? 'Deactivate' : 'Activate'} ${s.name}`}
+            disabled={toggleMut.isPending && toggleMut.variables?._id === s._id}
+            onClick={() => toggleMut.mutate(s)}
+          >
+            {s.isActive ? <PowerOff className="h-4 w-4" /> : <Power className="h-4 w-4" />}
+          </IconButton>
+          <IconButton label={`Delete ${s.name}`} danger onClick={() => onDelete(s)}>
+            <Trash2 className="h-4 w-4" />
+          </IconButton>
         </div>
       ),
     },
@@ -135,90 +166,116 @@ const Sensors: React.FC = () => {
 
   return (
     <div className="space-y-6">
-      <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
-        <div>
-          <h1 className="text-2xl font-bold text-foreground">Sensors</h1>
-          <p className="text-muted-foreground">Configure machine sensors (power / unit-cycle)</p>
-        </div>
-        <div className="flex flex-wrap items-center gap-3">
-          <Input className="w-full sm:w-64" placeholder="Search sensors…" icon={<Search className="h-4 w-4" />} value={table.searchInput} onChange={(e) => table.setSearch(e.target.value)} />
-          <Select className="w-44" value={table.filters.department ?? ''} onChange={(e) => table.setFilter('department', e.target.value)}>
-            <option value="">All departments</option>
-            {(departments.data ?? []).map((d) => <option key={d._id} value={d._id}>{d.name}</option>)}
-          </Select>
-          <Select className="w-36" value={table.filters.sensorType ?? ''} onChange={(e) => table.setFilter('sensorType', e.target.value)}>
-            <option value="">All types</option>
-            {SENSOR_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
-          </Select>
-          <Select className="w-32" value={table.filters.status ?? ''} onChange={(e) => table.setFilter('status', e.target.value)}>
-            <option value="">All status</option>
-            <option value="true">Active</option>
-            <option value="false">Inactive</option>
-          </Select>
-          <Button onClick={openCreate}><Plus className="h-4 w-4" /> New Sensor</Button>
-        </div>
-      </div>
+      <PageHeader
+        title="Sensors"
+        description="The signals each machine reports, such as power and unit cycles."
+        actions={<Button onClick={openCreate}><Plus className="h-4 w-4" /> New sensor</Button>}
+      />
 
-      <Card className="p-4">
-        <DataTable
-          columns={columns}
-          rows={table.items}
-          rowKey={(s) => s._id}
-          onSort={table.toggleSort}
-          empty={<EmptyState icon={<Cpu className="h-8 w-8" />} title="No sensors found" action={<Button onClick={openCreate}><Plus className="h-4 w-4" /> New Sensor</Button>} />}
-        />
+      <Section flush>
+        <div className="border-b border-border px-5 py-3">
+          <Toolbar>
+            <Input
+              className="w-64"
+              aria-label="Search sensors"
+              placeholder="Search sensors"
+              icon={<Search className="h-4 w-4" />}
+              value={table.searchInput}
+              onChange={(e) => table.setSearch(e.target.value)}
+            />
+            <Select className="w-44" aria-label="Filter by department" value={table.filters.department ?? ''} onChange={(e) => table.setFilter('department', e.target.value)}>
+              <option value="">All departments</option>
+              {(departments.data ?? []).map((d) => <option key={d._id} value={d._id}>{d.name}</option>)}
+            </Select>
+            <Select className="w-40" aria-label="Filter by type" value={table.filters.sensorType ?? ''} onChange={(e) => table.setFilter('sensorType', e.target.value)}>
+              <option value="">All types</option>
+              {SENSOR_TYPES.map((t) => <option key={t} value={t}>{typeLabel(t)}</option>)}
+            </Select>
+            <Select className="w-40" aria-label="Filter by status" value={table.filters.status ?? ''} onChange={(e) => table.setFilter('status', e.target.value)}>
+              <option value="">All statuses</option>
+              <option value="true">Active</option>
+              <option value="false">Inactive</option>
+            </Select>
+          </Toolbar>
+        </div>
+
+        {table.isLoading ? (
+          <PageLoader />
+        ) : table.isError ? (
+          <EmptyState
+            title="Sensors could not be loaded"
+            description="Check your connection and try again."
+            action={<Button variant="outline" onClick={() => table.refetch()}>Try again</Button>}
+          />
+        ) : (
+          <DataTable
+            columns={columns}
+            rows={table.items}
+            rowKey={(s) => s._id}
+            onSort={table.toggleSort}
+            empty={hasFilters ? (
+              <EmptyState
+                title="No sensors match these filters."
+                action={<Button variant="outline" onClick={clearFilters}>Clear filters</Button>}
+              />
+            ) : (
+              <EmptyState
+                title="No sensors yet"
+                description="Wire a machine's signals in Setup to create its sensors."
+                action={<Button onClick={openCreate}><Plus className="h-4 w-4" /> New sensor</Button>}
+              />
+            )}
+          />
+        )}
         <Pagination page={table.pagination?.currentPage ?? 1} totalPages={table.pagination?.totalPages ?? 1} onPage={table.setPage} />
-      </Card>
+      </Section>
 
       <Modal
         open={editing !== null}
         onClose={() => setEditing(null)}
-        title={editing === 'new' ? 'Create sensor' : 'Edit sensor'}
+        title={editing === 'new' ? 'New sensor' : 'Edit sensor'}
         footer={
           <>
             <Button variant="outline" onClick={() => setEditing(null)}>Cancel</Button>
-            <Button form="sensor-form" type="submit" loading={isSubmitting || saveMut.isPending}>{editing === 'new' ? 'Create' : 'Save'}</Button>
+            <Button form="sensor-form" type="submit" loading={isSubmitting || saveMut.isPending}>
+              {editing === 'new' ? 'Create sensor' : 'Save changes'}
+            </Button>
           </>
         }
       >
         <form id="sensor-form" className="space-y-4" onSubmit={handleSubmit((d) => saveMut.mutate(d))}>
-          <div>
-            <Label htmlFor="name">Sensor name *</Label>
-            <Input id="name" {...register('name')} />
-            {errors.name && <p className="mt-1 text-sm text-destructive">{errors.name.message}</p>}
-          </div>
-          <div className="grid grid-cols-2 gap-4">
-            <div>
-              <Label htmlFor="dept">Department *</Label>
+          <Field label="Name" error={errors.name?.message}>
+            <Input placeholder="e.g. Press 4 power" {...register('name')} />
+          </Field>
+          <div className="grid gap-4 sm:grid-cols-2">
+            <Field label="Department">
               <Select
-                id="dept"
                 value={formDept}
                 onChange={(e) => { setFormDept(e.target.value); setValue('machineId', ''); }}
               >
-                <option value="">Select…</option>
+                <option value="">Select a department</option>
                 {(departments.data ?? []).map((d) => <option key={d._id} value={d._id}>{d.name}</option>)}
               </Select>
-            </div>
-            <div>
-              <Label htmlFor="machineId">Machine *</Label>
-              <Select id="machineId" disabled={!formDept} {...register('machineId')}>
-                <option value="">Select…</option>
+            </Field>
+            <Field
+              label="Machine"
+              hint={!formDept ? 'Choose a department first.' : undefined}
+              error={errors.machineId?.message}
+            >
+              <Select disabled={!formDept} {...register('machineId')}>
+                <option value="">Select a machine</option>
                 {machineOptions.map((m) => <option key={m._id} value={m._id}>{m.name}</option>)}
               </Select>
-              {errors.machineId && <p className="mt-1 text-sm text-destructive">{errors.machineId.message}</p>}
-            </div>
+            </Field>
           </div>
-          <div>
-            <Label htmlFor="sensorType">Sensor type *</Label>
-            <Select id="sensorType" {...register('sensorType')}>
-              {SENSOR_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
+          <Field label="Type">
+            <Select {...register('sensorType')}>
+              {SENSOR_TYPES.map((t) => <option key={t} value={t}>{typeLabel(t)}</option>)}
             </Select>
-          </div>
-          <div>
-            <Label htmlFor="description">Description</Label>
-            <textarea id="description" rows={3} className="flex w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring" {...register('description')} />
-            {errors.description && <p className="mt-1 text-sm text-destructive">{errors.description.message}</p>}
-          </div>
+          </Field>
+          <Field label="Description" hint="Optional. Up to 200 characters." error={errors.description?.message}>
+            <textarea rows={3} className={textareaClass} {...register('description')} />
+          </Field>
         </form>
       </Modal>
     </div>

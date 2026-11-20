@@ -43,6 +43,7 @@ export interface SocketEventMap {
     timestamp: string;
   };
   'stoppage-resolved': { machineId: string; timestamp: string };
+  alert: { title: string; message: string; level: number; machineId: string; machine: string; department?: string | null; stoppedMinutes: number };
   'stoppage-updated': {
     machineId: string;
     hour: number;
@@ -69,20 +70,34 @@ type Listener = (data: unknown) => void;
 class SocketService {
   private socket: Socket | null = null;
   private listeners: Map<string, Listener[]> = new Map();
+  private statusListeners: Set<(connected: boolean) => void> = new Set();
+
+  /** True while the realtime connection is up. */
+  get connected(): boolean {
+    return this.socket?.connected ?? false;
+  }
+
+  /** Be told when the realtime connection comes up or drops. Returns the unsubscribe. */
+  onStatus(callback: (connected: boolean) => void): () => void {
+    this.statusListeners.add(callback);
+    return () => {
+      this.statusListeners.delete(callback);
+    };
+  }
+
+  private notifyStatus(connected: boolean) {
+    this.statusListeners.forEach((cb) => cb(connected));
+  }
 
   connect() {
-    if (this.socket?.connected) return;
+    // One socket for the app's lifetime; socket.io reconnects it by itself.
+    if (this.socket) return;
 
     const opts = { transports: ['websocket', 'polling'] as string[] };
     this.socket = SOCKET_URL ? io(SOCKET_URL, opts) : io(opts);
 
-    this.socket.on('connect', () => {
-      console.log('Connected to server');
-    });
-
-    this.socket.on('disconnect', () => {
-      console.log('Disconnected from server');
-    });
+    this.socket.on('connect', () => this.notifyStatus(true));
+    this.socket.on('disconnect', () => this.notifyStatus(false));
 
     // Re-register all listeners
     this.listeners.forEach((callbacks, event) => {
@@ -96,6 +111,7 @@ class SocketService {
     if (this.socket) {
       this.socket.disconnect();
       this.socket = null;
+      this.notifyStatus(false);
     }
   }
 

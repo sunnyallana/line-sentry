@@ -17,6 +17,8 @@ const Molds = lazy(() => import('./components/Molds'));
 const Configuration = lazy(() => import('./components/Configuration'));
 const Reports = lazy(() => import('./components/Reports'));
 const Setup = lazy(() => import('./components/Setup'));
+const Analysis = lazy(() => import('./components/Analysis'));
+const Board = lazy(() => import('./components/Board'));
 
 // Theme context (consumed across components for the dark/light toggle).
 export const ThemeContext = React.createContext<{
@@ -61,6 +63,7 @@ const App: React.FC = () => {
           <Suspense fallback={<Screen><PageLoader /></Screen>}>
             <Routes>
               <Route path="/login" element={<Login />} />
+              <Route path="/board" element={<ProtectedRoute><Board /></ProtectedRoute>} />
               <Route path="/" element={<ProtectedRoute><Layout /></ProtectedRoute>}>
                 <Route index element={<Navigate to="/dashboard" replace />} />
                 <Route path="dashboard" element={<Dashboard />} />
@@ -71,6 +74,7 @@ const App: React.FC = () => {
                 <Route path="setup" element={<RequireAdmin><Setup /></RequireAdmin>} />
                 <Route path="sensors" element={<RequireAdmin><Sensors /></RequireAdmin>} />
                 <Route path="molds" element={<RequireAdmin><Molds /></RequireAdmin>} />
+                <Route path="analysis" element={<Analysis />} />
                 <Route path="reports" element={<Reports />} />
                 <Route path="config" element={<RequireAdmin><Configuration /></RequireAdmin>} />
                 <Route path="*" element={<Navigate to="/dashboard" replace />} />

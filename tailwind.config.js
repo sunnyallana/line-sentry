@@ -9,6 +9,19 @@ export default {
       screens: { '2xl': '1400px' },
     },
     extend: {
+      fontFamily: {
+        // The platform's own UI font: it ships optical sizing and tuned tracking.
+        sans: [
+          '-apple-system',
+          'BlinkMacSystemFont',
+          '"SF Pro Text"',
+          '"Segoe UI Variable Text"',
+          '"Segoe UI"',
+          'system-ui',
+          'Roboto',
+          'sans-serif',
+        ],
+      },
       colors: {
         // Semantic tokens backed by CSS variables (see src/index.css). Using HSL
         // lets Tailwind's opacity modifiers (e.g. bg-primary/20) work.
@@ -43,9 +56,20 @@ export default {
         info: 'hsl(var(--info) / <alpha-value>)',
       },
       borderRadius: {
+        xl: 'calc(var(--radius) + 4px)',
         lg: 'var(--radius)',
-        md: 'calc(var(--radius) - 2px)',
-        sm: 'calc(var(--radius) - 4px)',
+        md: 'calc(var(--radius) - 3px)',
+        sm: 'calc(var(--radius) - 6px)',
+      },
+      boxShadow: {
+        // Small surfaces sit close to the page; sheets float well above it.
+        sm: '0 1px 2px hsl(var(--shadow-color) / 0.05)',
+        md: '0 4px 14px -4px hsl(var(--shadow-color) / 0.12)',
+        sheet: '0 24px 64px -16px hsl(var(--shadow-color) / 0.4), 0 2px 8px hsl(var(--shadow-color) / 0.1)',
+      },
+      transitionTimingFunction: {
+        // A critically damped spring, as a curve: fast start, no overshoot.
+        spring: 'cubic-bezier(0.32, 0.72, 0, 1)',
       },
       keyframes: {
         'fade-in': { from: { opacity: '0' }, to: { opacity: '1' } },
@@ -53,13 +77,18 @@ export default {
           from: { opacity: '0', transform: 'scale(0.97)' },
           to: { opacity: '1', transform: 'scale(1)' },
         },
+        'rise-in': {
+          from: { opacity: '0', transform: 'translateY(6px)' },
+          to: { opacity: '1', transform: 'translateY(0)' },
+        },
         shimmer: {
           '100%': { transform: 'translateX(100%)' },
         },
       },
       animation: {
-        'fade-in': 'fade-in 150ms ease-out',
-        'scale-in': 'scale-in 150ms ease-out',
+        'fade-in': 'fade-in 200ms ease-out both',
+        'scale-in': 'scale-in 300ms cubic-bezier(0.32, 0.72, 0, 1) both',
+        'rise-in': 'rise-in 350ms cubic-bezier(0.32, 0.72, 0, 1) both',
       },
     },
   },
