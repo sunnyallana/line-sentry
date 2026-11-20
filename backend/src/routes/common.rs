@@ -1,12 +1,15 @@
-//! Shared helpers for the CRUD/aggregation routes: query parsing, pagination
-//! metadata, safe search regex, and a BSON→clean-JSON converter.
+//! Shared helpers for the routes: query parsing, pagination metadata, regex
+//! escaping, lookups by id that several routes need, and a BSON→clean-JSON
+//! converter.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use bson::{doc, oid::ObjectId, Bson, Document};
+use bson::{oid::ObjectId, Bson, Document};
 use serde_json::{json, Map, Value};
 
 use crate::error::{AppError, AppResult};
+use crate::models::{HourlyData, Mold, ProductionRecord};
+use crate::persist::{DbResult, Entity, Filter, Persister, Store};
 
 pub fn q_str(q: &HashMap<String, String>, key: &str) -> String {
     q.get(key).cloned().unwrap_or_default()
@@ -14,6 +17,40 @@ pub fn q_str(q: &HashMap<String, String>, key: &str) -> String {
 
 pub fn q_int(q: &HashMap<String, String>, key: &str, default: i64) -> i64 {
     q.get(key).and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
+/// Largest page a list endpoint returns, whatever the client asks for.
+pub const MAX_PAGE_SIZE: i64 = 200;
+
+/// The requested page number, from 1.
+pub fn page_of(q: &HashMap<String, String>) -> i64 {
+    q_int(q, "page", 1).clamp(1, 1_000_000)
+}
+
+/// The requested page size, between 1 and [`MAX_PAGE_SIZE`].
+pub fn limit_of(q: &HashMap<String, String>) -> i64 {
+    q_int(q, "limit", 10).clamp(1, MAX_PAGE_SIZE)
+}
+
+/// The field the client wants to sort by, or empty when it is not a plain
+/// field name. Anything else (an operator, a path into a system field) would
+/// reach the database as part of the sort.
+pub fn sort_field(q: &HashMap<String, String>) -> String {
+    let field = q_str(q, "sortBy");
+    let plain = !field.is_empty()
+        && field.len() <= 64
+        && field
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+        && field
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic());
+    if plain {
+        field
+    } else {
+        String::new()
+    }
 }
 
 pub fn parse_oid(s: &str) -> AppResult<ObjectId> {
@@ -32,27 +69,59 @@ pub fn escape_regex(s: &str) -> String {
     out
 }
 
-/// Build a safe `{ $regex, $options: "i" }` doc, or `None` for empty input.
-pub fn search_regex(s: &str) -> Option<Document> {
-    let t = s.trim();
-    if t.is_empty() {
-        return None;
+/// One string field of the rows with the given ids, by `_id`, in one read.
+pub async fn names_by_id<T: Entity>(
+    rows: &Persister<T>,
+    ids: HashSet<ObjectId>,
+    field: &str,
+) -> DbResult<HashMap<ObjectId, String>> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
     }
-    let capped: String = t.chars().take(100).collect();
-    Some(doc! { "$regex": escape_regex(&capped), "$options": "i" })
+    let found = rows
+        .select(Filter::all().any_of("_id", ids), &[field])
+        .await?;
+    Ok(found
+        .iter()
+        .filter_map(|d| {
+            Some((
+                d.get_object_id("_id").ok()?,
+                d.get_str(field).ok()?.to_string(),
+            ))
+        })
+        .collect())
 }
 
-/// `{ <sortBy>: 1|-1 }` for an aggregation `$sort` (defaults to createdAt desc).
-pub fn sort_doc(sort_by: &str, sort_order: &str) -> Document {
-    let order: i32 = if sort_order == "asc" { 1 } else { -1 };
-    let key = if sort_by.is_empty() {
-        "createdAt"
-    } else {
-        sort_by
-    };
-    let mut d = Document::new();
-    d.insert(key, order);
-    d
+/// The molds the records' hours ran with, by `_id`, in one read.
+pub async fn molds_used(
+    store: &Store,
+    records: &[ProductionRecord],
+) -> DbResult<HashMap<ObjectId, Mold>> {
+    let ids: HashSet<ObjectId> = records
+        .iter()
+        .flat_map(|r| r.hourly_data.iter())
+        .filter_map(|h| h.mold_id.map(|m| m.oid()))
+        .collect();
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let molds = store
+        .molds
+        .rows
+        .find(Filter::all().any_of("_id", ids))
+        .await?;
+    Ok(molds
+        .into_iter()
+        .filter_map(|m| m.id.map(|id| (id.oid(), m)))
+        .collect())
+}
+
+/// The ideal hourly rate of the mold the hour ran with, or 0 without one.
+pub fn mold_rate(molds: &HashMap<ObjectId, Mold>, h: &HourlyData) -> f64 {
+    h.mold_id
+        .and_then(|m| molds.get(&m.oid()))
+        .map(|m| m.production_capacity_per_hour)
+        .unwrap_or(0.0)
 }
 
 /// Pagination metadata matching the Node response shape. `total_key` is the
@@ -110,7 +179,7 @@ pub fn bson_to_json(b: Bson) -> Value {
         Bson::Null => Value::Null,
         Bson::Array(a) => Value::Array(a.into_iter().map(bson_to_json).collect()),
         Bson::Document(d) => doc_to_json(d),
-        // Decimal128, Binary, RegEx, etc. — fall back to relaxed extended JSON.
+        // Decimal128, Binary, RegEx, etc.: fall back to relaxed extended JSON.
         other => other.into_relaxed_extjson(),
     }
 }

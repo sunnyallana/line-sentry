@@ -7,15 +7,15 @@
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
-use bson::{doc, oid::ObjectId, Bson, Document};
+use bson::{oid::ObjectId, Bson};
 use chrono::{DateTime, Utc};
-use futures::TryStreamExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::auth::{AuthUser, DaemonKey};
 use crate::error::{AppError, AppResult};
-use crate::models::{Id, DEFAULT_PLC, PRODUCTION_RECORDS, SIGNAL_DATA};
+use crate::models::{Id, DEFAULT_PLC};
+use crate::persist::signals::unclassified_stoppages;
 use crate::pipeline;
 use crate::state::AppState;
 
@@ -29,6 +29,61 @@ pub struct PinDataReq {
     plc_id: Option<String>,
 }
 
+#[derive(Deserialize)]
+pub struct Reading {
+    #[serde(rename = "pinData")]
+    pin_data: String,
+    timestamp: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct PinBatchReq {
+    #[serde(rename = "plcId")]
+    plc_id: Option<String>,
+    readings: Vec<Reading>,
+}
+
+/// Most readings one batch may carry (ten minutes at one per second).
+const MAX_BATCH: usize = 600;
+
+/// Ingest readings a daemon held back while the backend was unreachable, oldest
+/// first. Each carries its own timestamp, so a batch can be resent safely.
+pub async fn pin_data_batch(
+    _key: DaemonKey,
+    State(state): State<AppState>,
+    Json(body): Json<PinBatchReq>,
+) -> AppResult<Json<Value>> {
+    if body.readings.is_empty() {
+        return Err(AppError::bad_request("readings must not be empty"));
+    }
+    if body.readings.len() > MAX_BATCH {
+        return Err(AppError::bad_request(format!(
+            "a batch can carry at most {MAX_BATCH} readings"
+        )));
+    }
+    if body
+        .readings
+        .iter()
+        .any(|r| r.timestamp.as_deref().unwrap_or("").is_empty())
+    {
+        return Err(AppError::bad_request(
+            "every reading in a batch needs its own timestamp",
+        ));
+    }
+    let plc_id = body
+        .plc_id
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(DEFAULT_PLC);
+    let readings: Vec<(String, Option<String>)> = body
+        .readings
+        .into_iter()
+        .map(|r| (r.pin_data, r.timestamp))
+        .collect();
+    let (applied, rejected) = pipeline::process_batch(&state, plc_id, &readings).await?;
+    Ok(Json(json!({ "applied": applied, "rejected": rejected })))
+}
+
 /// Ingest one pin byte from the daemon. Guarded by the daemon API key.
 pub async fn pin_data(
     _key: DaemonKey,
@@ -39,8 +94,13 @@ pub async fn pin_data(
     if pin.is_empty() {
         return Err(AppError::bad_request("pinData is required"));
     }
-    let plc_id = body.plc_id.as_deref().filter(|s| !s.is_empty()).unwrap_or(DEFAULT_PLC);
-    let processed = pipeline::process_pin_data(&state, plc_id, &pin, body.timestamp.as_deref()).await?;
+    let plc_id = body
+        .plc_id
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(DEFAULT_PLC);
+    let processed =
+        pipeline::process_pin_data(&state, plc_id, &pin, body.timestamp.as_deref()).await?;
     Ok(Json(json!({
         "message": "Pin data processed successfully",
         "processedMachines": processed,
@@ -52,34 +112,7 @@ pub async fn unclassified_stoppages_count(
     _user: AuthUser,
     State(state): State<AppState>,
 ) -> AppResult<Json<Value>> {
-    let stages = vec![
-        doc! { "$match": { "hourlyData.stoppages.reason": "unclassified" } },
-        doc! { "$project": { "unclassifiedCount": { "$size": { "$filter": {
-            "input": { "$reduce": {
-                "input": "$hourlyData",
-                "initialValue": [],
-                "in": { "$concatArrays": ["$$value", "$$this.stoppages"] },
-            }},
-            "cond": { "$eq": ["$$this.reason", "unclassified"] },
-        }}}}},
-        doc! { "$group": { "_id": Bson::Null, "total": { "$sum": "$unclassifiedCount" } } },
-    ];
-
-    let mut cursor = state
-        .db
-        .collection::<Document>(PRODUCTION_RECORDS)
-        .aggregate(stages)
-        .await?;
-
-    let count = match cursor.try_next().await? {
-        Some(d) => match d.get("total") {
-            Some(Bson::Int32(i)) => *i as i64,
-            Some(Bson::Int64(i)) => *i,
-            Some(Bson::Double(f)) => *f as i64,
-            _ => 0,
-        },
-        None => 0,
-    };
+    let count = unclassified_stoppages(&state.store.records).await?;
     Ok(Json(json!({ "count": count })))
 }
 
@@ -91,24 +124,9 @@ pub async fn recent(
 ) -> AppResult<Json<Value>> {
     let oid = ObjectId::parse_str(&machine_id)
         .map_err(|_| AppError::bad_request("invalid machine id"))?;
-    let stages = vec![
-        doc! { "$match": { "machineId": oid } },
-        doc! { "$lookup": {
-            "from": "sensors",
-            "localField": "sensorId",
-            "foreignField": "_id",
-            "as": "sensorId",
-        }},
-        doc! { "$unwind": "$sensorId" },
-    ];
-
-    let docs: Vec<Document> = state
-        .db
-        .collection::<Document>(SIGNAL_DATA)
-        .aggregate(stages)
-        .await?
-        .try_collect()
-        .await?;
+    // The newest readings may still be waiting in the bulk writer.
+    state.store.flush().await;
+    let docs = state.store.signals.latest_on(oid).await?;
     Ok(Json(crate::routes::common::docs_to_json(docs)))
 }
 
@@ -137,17 +155,9 @@ pub async fn post_signal(
     let value_bson = bson::to_bson(&body.value).unwrap_or(Bson::Null);
 
     state
-        .db
-        .collection::<Document>(SIGNAL_DATA)
-        .update_one(
-            doc! { "sensorId": body.sensor_id.oid() },
-            doc! { "$set": {
-                "machineId": body.machine_id.oid(),
-                "value": value_bson,
-                "timestamp": bson::DateTime::from_chrono(ts),
-            }},
-        )
-        .upsert(true)
+        .store
+        .signals
+        .set_latest(body.sensor_id.oid(), body.machine_id.oid(), value_bson, ts)
         .await?;
 
     Ok((

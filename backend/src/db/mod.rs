@@ -1,9 +1,8 @@
-//! MongoDB connection and index management.
+//! MongoDB connection.
 
 use std::time::Duration;
 
 use anyhow::Context;
-use bson::doc;
 use mongodb::options::ClientOptions;
 use mongodb::{Client, Database};
 
@@ -23,9 +22,4 @@ pub async fn connect(config: &Config) -> anyhow::Result<Database> {
 
     let client = Client::with_options(opts).context("building MongoDB client")?;
     Ok(client.database(&config.db_name))
-}
-
-/// Quick connectivity probe used by the health/readiness endpoints.
-pub async fn ping(db: &Database) -> bool {
-    db.run_command(doc! { "ping": 1 }).await.is_ok()
 }

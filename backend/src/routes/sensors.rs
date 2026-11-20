@@ -5,36 +5,22 @@ use std::collections::HashMap;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
-use bson::{doc, Document};
 use chrono::Utc;
-use futures::TryStreamExt;
+use futures::future::try_join;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::auth::{AdminUser, AuthUser};
 use crate::error::{AppError, AppResult};
 use crate::models::*;
+use crate::persist::sensors::{Listing, Slice};
+use crate::persist::Filter;
 use crate::routes::common::*;
 use crate::state::AppState;
 
-fn with_machine() -> Vec<Document> {
-    vec![
-        doc! { "$lookup": { "from": MACHINES, "localField": "machineId", "foreignField": "_id", "as": "machineId" } },
-        doc! { "$unwind": { "path": "$machineId", "preserveNullAndEmptyArrays": true } },
-    ]
-}
-
 /// All active sensors, machine populated.
 pub async fn list(_user: AuthUser, State(state): State<AppState>) -> AppResult<Json<Value>> {
-    let mut stages = vec![doc! { "$match": { "isActive": true } }];
-    stages.extend(with_machine());
-    let docs: Vec<Document> = state
-        .db
-        .collection::<Document>(SENSORS)
-        .aggregate(stages)
-        .await?
-        .try_collect()
-        .await?;
+    let docs = state.store.sensors.active_with_machine(None).await?;
     Ok(Json(docs_to_json(docs)))
 }
 
@@ -44,15 +30,7 @@ pub async fn by_machine(
     Path(machine_id): Path<String>,
 ) -> AppResult<Json<Value>> {
     let oid = parse_oid(&machine_id)?;
-    let mut stages = vec![doc! { "$match": { "machineId": oid, "isActive": true } }];
-    stages.extend(with_machine());
-    let docs: Vec<Document> = state
-        .db
-        .collection::<Document>(SENSORS)
-        .aggregate(stages)
-        .await?
-        .try_collect()
-        .await?;
+    let docs = state.store.sensors.active_with_machine(Some(oid)).await?;
     Ok(Json(docs_to_json(docs)))
 }
 
@@ -62,73 +40,46 @@ pub async fn admin_all(
     State(state): State<AppState>,
     Query(q): Query<HashMap<String, String>>,
 ) -> AppResult<Json<Value>> {
-    let page = q_int(&q, "page", 1).max(1);
-    let limit = q_int(&q, "limit", 10).max(1);
-    let skip = (page - 1) * limit;
+    let page = page_of(&q);
+    let limit = limit_of(&q);
 
-    let mut match_stage = Document::new();
-    if let Some(rx) = search_regex(&q_str(&q, "search")) {
-        match_stage.insert(
-            "$or",
-            vec![
-                doc! { "name": &rx },
-                doc! { "description": &rx },
-                doc! { "sensorType": &rx },
-            ],
-        );
-    }
-    if let "true" | "false" = q_str(&q, "status").as_str() {
-        match_stage.insert("isActive", q_str(&q, "status") == "true");
-    }
+    let search = q_str(&q, "search");
+    let pattern: String = search.trim().chars().take(100).collect();
+    let pattern = (!pattern.is_empty()).then(|| escape_regex(&pattern));
+    let status = q_str(&q, "status");
     let sensor_type = q_str(&q, "sensorType");
-    if !sensor_type.trim().is_empty() {
-        match_stage.insert("sensorType", sensor_type);
-    }
-
-    let mut pipeline = vec![doc! { "$match": match_stage }];
-    pipeline.push(doc! { "$lookup": {
-        "from": MACHINES, "localField": "machineId", "foreignField": "_id", "as": "machineId",
-        "pipeline": [
-            { "$lookup": { "from": DEPARTMENTS, "localField": "departmentId", "foreignField": "_id", "as": "departmentId" } },
-            { "$unwind": "$departmentId" }
-        ]
-    }});
-    pipeline.push(doc! { "$unwind": "$machineId" });
     let department = q_str(&q, "department");
-    if !department.trim().is_empty() {
-        let dep_oid = parse_oid(&department)?;
-        pipeline.push(doc! { "$match": { "machineId.departmentId._id": dep_oid } });
-    }
-    pipeline.push(doc! { "$sort": sort_doc(&q_str(&q, "sortBy"), &q_str(&q, "sortOrder")) });
+    let (sort_by, sort_order) = (sort_field(&q), q_str(&q, "sortOrder"));
 
-    let mut count_pipeline = pipeline.clone();
-    count_pipeline.push(doc! { "$count": "total" });
-    pipeline.push(doc! { "$skip": skip });
-    pipeline.push(doc! { "$limit": limit });
-
-    let coll = state.db.collection::<Document>(SENSORS);
-    let docs: Vec<Document> = coll.aggregate(pipeline).await?.try_collect().await?;
-    let total = coll
-        .aggregate(count_pipeline)
-        .await?
-        .try_collect::<Vec<Document>>()
-        .await?
-        .first()
-        .and_then(|d| {
-            d.get_i32("total")
-                .ok()
-                .map(|v| v as i64)
-                .or_else(|| d.get_i64("total").ok())
-        })
-        .unwrap_or(0);
+    let listing = Listing {
+        search: pattern.as_deref(),
+        active: match status.as_str() {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        },
+        kind: (!sensor_type.trim().is_empty()).then_some(sensor_type.as_str()),
+        department: if department.trim().is_empty() {
+            None
+        } else {
+            Some(parse_oid(&department)?)
+        },
+        slice: Slice {
+            sort_by: &sort_by,
+            ascending: sort_order == "asc",
+            skip: (page - 1) * limit,
+            limit,
+        },
+    };
+    let (docs, total) = state.store.sensors.admin_page(&listing).await?;
 
     Ok(Json(json!({
         "sensors": docs_to_json(docs),
         "pagination": pagination(page, limit, total, "totalSensors"),
         "filters": {
-            "search": q_str(&q, "search"), "department": department,
-            "status": q_str(&q, "status"), "sensorType": q_str(&q, "sensorType"),
-            "sortBy": q_str(&q, "sortBy"), "sortOrder": q_str(&q, "sortOrder"),
+            "search": search, "department": department,
+            "status": status, "sensorType": sensor_type,
+            "sortBy": sort_by, "sortOrder": sort_order,
         }
     })))
 }
@@ -142,12 +93,7 @@ pub async fn create(
     let now = Utc::now();
     body.created_at = Some(now);
     body.updated_at = Some(now);
-    let res = state
-        .db
-        .collection::<Sensor>(SENSORS)
-        .insert_one(&body)
-        .await?;
-    body.id = res.inserted_id.as_object_id().map(Id);
+    body.id = Some(Id(state.store.sensors.rows.insert(&body).await?));
     Ok((StatusCode::CREATED, Json(body)))
 }
 
@@ -158,15 +104,14 @@ pub async fn update(
     Json(mut body): Json<Sensor>,
 ) -> AppResult<Json<Sensor>> {
     let oid = parse_oid(&id)?;
-    let coll = state.db.collection::<Sensor>(SENSORS);
-    let existing = coll
-        .find_one(doc! { "_id": oid })
-        .await?
-        .ok_or(AppError::NotFound)?;
+    let sensors = &state.store.sensors;
+    let existing = sensors.rows.get(oid).await?.ok_or(AppError::NotFound)?;
+    sensors.edit(oid, &body).await?;
+    // The pipeline caches each pin's sensor type and machine.
+    state.pipeline.invalidate_pin_cache();
     body.id = Some(Id(oid));
     body.created_at = existing.created_at;
     body.updated_at = Some(Utc::now());
-    coll.replace_one(doc! { "_id": oid }, &body).await?;
     Ok(Json(body))
 }
 
@@ -177,19 +122,16 @@ pub async fn delete(
     Path(id): Path<String>,
 ) -> AppResult<Json<Value>> {
     let oid = parse_oid(&id)?;
-    state
-        .db
-        .collection::<Document>(SENSOR_PIN_MAPPINGS)
-        .delete_many(doc! { "sensorId": oid })
-        .await?;
-    let res = state
-        .db
-        .collection::<Sensor>(SENSORS)
-        .delete_one(doc! { "_id": oid })
-        .await?;
-    if res.deleted_count == 0 {
+    let store = &state.store;
+    let (_, deleted) = try_join(
+        store.pins.unwire(oid),
+        store.sensors.rows.delete(Filter::id(oid)),
+    )
+    .await?;
+    if deleted == 0 {
         return Err(AppError::NotFound);
     }
+    state.pipeline.invalidate_pin_cache();
     Ok(Json(json!({ "message": "Sensor permanently deleted" })))
 }
 
@@ -213,29 +155,22 @@ pub async fn create_pin_mapping(
         .clone()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| DEFAULT_PLC.to_string());
-    let coll = state.db.collection::<SensorPinMapping>(SENSOR_PIN_MAPPINGS);
-    if coll
-        .find_one(doc! { "plcId": &plc_id, "pinId": &body.pin_id })
-        .await?
-        .is_some()
-    {
-        return Err(AppError::bad_request("That pin is already in use on this PLC"));
+    let pins = &state.store.pins;
+    let (pin_taken, sensor_wired) = try_join(
+        pins.is_taken(&plc_id, &body.pin_id),
+        pins.is_wired(body.sensor_id.oid()),
+    )
+    .await?;
+    if pin_taken {
+        return Err(AppError::bad_request(
+            "That pin is already in use on this PLC",
+        ));
     }
-    if coll
-        .find_one(doc! { "sensorId": body.sensor_id.oid() })
-        .await?
-        .is_some()
-    {
+    if sensor_wired {
         return Err(AppError::bad_request("Sensor is already mapped to a pin"));
     }
-    let mut mapping = SensorPinMapping {
-        id: None,
-        sensor_id: body.sensor_id,
-        plc_id,
-        pin_id: body.pin_id,
-    };
-    let res = coll.insert_one(&mapping).await?;
-    mapping.id = res.inserted_id.as_object_id().map(Id);
+    let mapping = pins.wire(body.sensor_id, &plc_id, &body.pin_id).await?;
+    state.pipeline.invalidate_pin_cache();
     Ok((StatusCode::CREATED, Json(mapping)))
 }
 
@@ -243,23 +178,7 @@ pub async fn pin_mappings(
     _admin: AdminUser,
     State(state): State<AppState>,
 ) -> AppResult<Json<Value>> {
-    let stages = vec![
-        doc! { "$lookup": {
-            "from": SENSORS, "localField": "sensorId", "foreignField": "_id", "as": "sensorId",
-            "pipeline": [
-                { "$lookup": { "from": MACHINES, "localField": "machineId", "foreignField": "_id", "as": "machineId" } },
-                { "$unwind": "$machineId" }
-            ]
-        }},
-        doc! { "$unwind": "$sensorId" },
-    ];
-    let docs: Vec<Document> = state
-        .db
-        .collection::<Document>(SENSOR_PIN_MAPPINGS)
-        .aggregate(stages)
-        .await?
-        .try_collect()
-        .await?;
+    let docs = state.store.pins.with_sensor().await?;
     Ok(Json(docs_to_json(docs)))
 }
 
@@ -269,14 +188,10 @@ pub async fn delete_pin_mapping(
     Path(id): Path<String>,
 ) -> AppResult<Json<Value>> {
     let oid = parse_oid(&id)?;
-    let res = state
-        .db
-        .collection::<Document>(SENSOR_PIN_MAPPINGS)
-        .delete_one(doc! { "_id": oid })
-        .await?;
-    if res.deleted_count == 0 {
+    if state.store.pins.rows.delete(Filter::id(oid)).await? == 0 {
         return Err(AppError::NotFound);
     }
+    state.pipeline.invalidate_pin_cache();
     Ok(Json(
         json!({ "message": "Pin mapping deleted successfully" }),
     ))

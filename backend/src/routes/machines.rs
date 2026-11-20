@@ -6,23 +6,17 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
 use bson::oid::ObjectId;
-use bson::{doc, Document};
 use chrono::Utc;
-use futures::TryStreamExt;
+use futures::future::{try_join, try_join3, try_join5};
 use serde_json::{json, Value};
 
 use crate::auth::{AdminUser, AuthUser};
 use crate::error::{AppError, AppResult};
 use crate::models::*;
+use crate::persist::machines::active_department_names;
+use crate::persist::{records, sensors, Filter};
 use crate::routes::common::*;
 use crate::state::AppState;
-
-fn with_department() -> Vec<Document> {
-    vec![
-        doc! { "$lookup": { "from": DEPARTMENTS, "localField": "departmentId", "foreignField": "_id", "as": "departmentId" } },
-        doc! { "$unwind": { "path": "$departmentId", "preserveNullAndEmptyArrays": true } },
-    ]
-}
 
 /// Active machines in a department (operator-scoped), department populated.
 pub async fn by_department(
@@ -34,14 +28,10 @@ pub async fn by_department(
     if user.role == "operator" && user.department_id.map(|d| d.oid()) != Some(oid) {
         return Err(AppError::Forbidden);
     }
-    let mut stages = vec![doc! { "$match": { "departmentId": oid, "isActive": true } }];
-    stages.extend(with_department());
-    let docs: Vec<Document> = state
-        .db
-        .collection::<Document>(MACHINES)
-        .aggregate(stages)
-        .await?
-        .try_collect()
+    let docs = state
+        .store
+        .machines
+        .active_with_department(Some(oid))
         .await?;
     Ok(Json(docs_to_json(docs)))
 }
@@ -52,39 +42,19 @@ pub async fn get_one(
     Path(id): Path<String>,
 ) -> AppResult<Json<Value>> {
     let oid = parse_oid(&id)?;
-    let machine = state
-        .db
-        .collection::<Machine>(MACHINES)
-        .find_one(doc! { "_id": oid })
-        .await?
-        .ok_or(AppError::NotFound)?;
+    let machines = &state.store.machines;
+    let (machine, populated) =
+        try_join(machines.rows.get(oid), machines.one_with_department(oid)).await?;
+    let machine = machine.ok_or(AppError::NotFound)?;
     if user.role == "operator" && user.department_id != Some(machine.department_id) {
         return Err(AppError::Forbidden);
     }
-    let mut stages = vec![doc! { "$match": { "_id": oid } }];
-    stages.extend(with_department());
-    let docs: Vec<Document> = state
-        .db
-        .collection::<Document>(MACHINES)
-        .aggregate(stages)
-        .await?
-        .try_collect()
-        .await?;
-    let first = docs.into_iter().next().ok_or(AppError::NotFound)?;
-    Ok(Json(doc_to_json(first)))
+    Ok(Json(doc_to_json(populated.ok_or(AppError::NotFound)?)))
 }
 
 /// All active machines (admin), department populated.
 pub async fn list(_admin: AdminUser, State(state): State<AppState>) -> AppResult<Json<Value>> {
-    let mut stages = vec![doc! { "$match": { "isActive": true } }];
-    stages.extend(with_department());
-    let docs: Vec<Document> = state
-        .db
-        .collection::<Document>(MACHINES)
-        .aggregate(stages)
-        .await?
-        .try_collect()
-        .await?;
+    let docs = state.store.machines.active_with_department(None).await?;
     Ok(Json(docs_to_json(docs)))
 }
 
@@ -106,12 +76,7 @@ pub async fn create(
     let now = Utc::now();
     body.created_at = Some(now);
     body.updated_at = Some(now);
-    let res = state
-        .db
-        .collection::<Machine>(MACHINES)
-        .insert_one(&body)
-        .await?;
-    body.id = res.inserted_id.as_object_id().map(Id);
+    body.id = Some(Id(state.store.machines.rows.insert(&body).await?));
     Ok((StatusCode::CREATED, Json(body)))
 }
 
@@ -122,15 +87,16 @@ pub async fn update(
     Json(mut body): Json<Machine>,
 ) -> AppResult<Json<Machine>> {
     let oid = parse_oid(&id)?;
-    let coll = state.db.collection::<Machine>(MACHINES);
-    let existing = coll
-        .find_one(doc! { "_id": oid })
-        .await?
-        .ok_or(AppError::NotFound)?;
+    let machines = &state.store.machines;
+    let existing = machines.rows.get(oid).await?.ok_or(AppError::NotFound)?;
+    machines.edit(oid, &body).await?;
+
+    // Hand back what is stored, with the state fields the client did not send.
     body.id = Some(Id(oid));
+    body.status = existing.status;
+    body.status_since = existing.status_since;
     body.created_at = existing.created_at;
     body.updated_at = Some(Utc::now());
-    coll.replace_one(doc! { "_id": oid }, &body).await?;
     Ok(Json(body))
 }
 
@@ -151,17 +117,9 @@ pub async fn position(
 ) -> AppResult<Json<Value>> {
     let oid = parse_oid(&id)?;
     let updated = state
-        .db
-        .collection::<Document>(MACHINES)
-        .find_one_and_update(
-            doc! { "_id": oid },
-            doc! { "$set": {
-                "position": { "x": p.x, "y": p.y },
-                "dimensions": { "width": p.width, "height": p.height },
-                "updatedAt": bson::DateTime::now(),
-            }},
-        )
-        .return_document(mongodb::options::ReturnDocument::After)
+        .store
+        .machines
+        .place(oid, (p.x, p.y), (p.width, p.height))
         .await?
         .ok_or(AppError::NotFound)?;
     Ok(Json(doc_to_json(updated)))
@@ -174,26 +132,30 @@ pub async fn delete(
     Path(id): Path<String>,
 ) -> AppResult<Json<Value>> {
     let oid = parse_oid(&id)?;
-    let coll = state.db.collection::<Machine>(MACHINES);
-    if coll.find_one(doc! { "_id": oid }).await?.is_none() {
+    let store = &state.store;
+    if !store.machines.rows.exists(Filter::id(oid)).await? {
         return Err(AppError::NotFound);
     }
-    state
-        .db
-        .collection::<Document>(SENSORS)
-        .delete_many(doc! { "machineId": oid })
+    // The sensors' pins are freed first: a mapping left behind would keep its
+    // pin "in use" and its PLC undeletable.
+    let sensor_ids = store
+        .sensors
+        .rows
+        .ids(Filter::all().eq(sensors::f::MACHINE, oid))
         .await?;
-    state
-        .db
-        .collection::<Document>(PRODUCTION_RECORDS)
-        .delete_many(doc! { "machineId": oid })
-        .await?;
-    state
-        .db
-        .collection::<Document>(SIGNAL_DATA)
-        .delete_many(doc! { "machineId": oid })
-        .await?;
-    coll.delete_one(doc! { "_id": oid }).await?;
+    store.pins.of_machine_sensors_delete(&sensor_ids).await?;
+    // The machine goes last, so a cascade that failed part-way can be retried.
+    try_join3(
+        store.sensors.delete_on(oid),
+        store
+            .records
+            .rows
+            .delete_all(Filter::all().eq(records::f::MACHINE, oid)),
+        store.signals.delete_on(oid),
+    )
+    .await?;
+    store.machines.rows.delete(Filter::id(oid)).await?;
+    state.pipeline.invalidate_pin_cache();
     Ok(Json(
         json!({ "message": "Machine and all related data deleted successfully" }),
     ))
@@ -219,24 +181,20 @@ pub async fn signals_list(
     Path(id): Path<String>,
 ) -> AppResult<Json<Value>> {
     let oid = parse_oid(&id)?;
-    let sensors: Vec<Sensor> = state
-        .db
-        .collection::<Sensor>(SENSORS)
-        .find(doc! { "machineId": oid, "isActive": true })
-        .await?
-        .try_collect()
-        .await?;
-    let mappings: Vec<SensorPinMapping> = state
-        .db
-        .collection::<SensorPinMapping>(SENSOR_PIN_MAPPINGS)
-        .find(doc! {})
-        .await?
-        .try_collect()
-        .await?;
+    let sensors = state.store.sensors.active_on(oid).await?;
+    let ids: Vec<ObjectId> = sensors
+        .iter()
+        .filter_map(|s| s.id)
+        .map(|i| i.oid())
+        .collect();
+    let mut wired: HashMap<Id, SensorPinMapping> = HashMap::new();
+    for m in state.store.pins.of_sensors(&ids).await? {
+        wired.entry(m.sensor_id).or_insert(m);
+    }
     let out: Vec<Value> = sensors
         .iter()
         .map(|s| {
-            let m = s.id.and_then(|sid| mappings.iter().find(|m| m.sensor_id == sid));
+            let m = s.id.and_then(|sid| wired.get(&sid));
             json!({
                 "sensorId": s.id.map(|i| i.to_hex()),
                 "name": s.name,
@@ -257,30 +215,29 @@ pub async fn signals_create(
     Json(b): Json<SignalReq>,
 ) -> AppResult<(StatusCode, Json<Value>)> {
     let oid = parse_oid(&id)?;
-    if b.role != "power" && b.role != "unit-cycle" {
-        return Err(AppError::bad_request("role must be 'power' or 'unit-cycle'"));
-    }
-    if state
-        .db
-        .collection::<Machine>(MACHINES)
-        .find_one(doc! { "_id": oid })
-        .await?
-        .is_none()
-    {
-        return Err(AppError::NotFound);
+    if b.role != sensors::POWER && b.role != sensors::UNIT_CYCLE {
+        return Err(AppError::bad_request(
+            "role must be 'power' or 'unit-cycle'",
+        ));
     }
     let plc_id = b
         .plc_id
         .clone()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| DEFAULT_PLC.to_string());
-    let pin_coll = state.db.collection::<SensorPinMapping>(SENSOR_PIN_MAPPINGS);
-    if pin_coll
-        .find_one(doc! { "plcId": &plc_id, "pinId": &b.pin_id })
-        .await?
-        .is_some()
-    {
-        return Err(AppError::bad_request("That pin is already in use on this PLC"));
+    let store = &state.store;
+    let (machine_exists, pin_taken) = try_join(
+        store.machines.rows.exists(Filter::id(oid)),
+        store.pins.is_taken(&plc_id, &b.pin_id),
+    )
+    .await?;
+    if !machine_exists {
+        return Err(AppError::NotFound);
+    }
+    if pin_taken {
+        return Err(AppError::bad_request(
+            "That pin is already in use on this PLC",
+        ));
     }
 
     let now = Utc::now();
@@ -288,7 +245,11 @@ pub async fn signals_create(
         id: None,
         name: format!(
             "{} signal",
-            if b.role == "power" { "Power" } else { "Cycle" }
+            if b.role == sensors::POWER {
+                "Power"
+            } else {
+                "Cycle"
+            }
         ),
         description: None,
         machine_id: Id(oid),
@@ -297,25 +258,11 @@ pub async fn signals_create(
         created_at: Some(now),
         updated_at: Some(now),
     };
-    let res = state
-        .db
-        .collection::<Sensor>(SENSORS)
-        .insert_one(&sensor)
-        .await?;
-    let sensor_id = res
-        .inserted_id
-        .as_object_id()
-        .map(Id)
-        .ok_or_else(|| AppError::Internal(anyhow::anyhow!("sensor insert returned no id")))?;
+    // The sensor first: one left without a pin is harmless, a pin held for a
+    // sensor that does not exist is not.
+    let sensor_id = Id(store.sensors.rows.insert(&sensor).await?);
     sensor.id = Some(sensor_id);
-
-    let mapping = SensorPinMapping {
-        id: None,
-        sensor_id,
-        plc_id: plc_id.clone(),
-        pin_id: b.pin_id.clone(),
-    };
-    pin_coll.insert_one(&mapping).await?;
+    store.pins.wire(sensor_id, &plc_id, &b.pin_id).await?;
     state.pipeline.invalidate_pin_cache();
 
     Ok((
@@ -337,17 +284,13 @@ pub async fn signals_delete(
     Path((_machine_id, sensor_id)): Path<(String, String)>,
 ) -> AppResult<Json<Value>> {
     let sid = parse_oid(&sensor_id)?;
-    state
-        .db
-        .collection::<Document>(SENSOR_PIN_MAPPINGS)
-        .delete_many(doc! { "sensorId": sid })
-        .await?;
-    let res = state
-        .db
-        .collection::<Sensor>(SENSORS)
-        .delete_one(doc! { "_id": sid })
-        .await?;
-    if res.deleted_count == 0 {
+    let store = &state.store;
+    let (_, deleted) = try_join(
+        store.pins.unwire(sid),
+        store.sensors.rows.delete(Filter::id(sid)),
+    )
+    .await?;
+    if deleted == 0 {
         return Err(AppError::NotFound);
     }
     state.pipeline.invalidate_pin_cache();
@@ -356,64 +299,34 @@ pub async fn signals_delete(
 
 /// Plant-wide setup readiness: what each machine still needs before its
 /// OEE / MTTR / MTBF are meaningful.
-pub async fn setup_status(_admin: AdminUser, State(state): State<AppState>) -> AppResult<Json<Value>> {
-    let machines: Vec<Machine> = state
-        .db
-        .collection::<Machine>(MACHINES)
-        .find(doc! { "isActive": true })
-        .await?
-        .try_collect()
-        .await?;
-    let sensors: Vec<Sensor> = state
-        .db
-        .collection::<Sensor>(SENSORS)
-        .find(doc! { "isActive": true })
-        .await?
-        .try_collect()
-        .await?;
-    let mappings: Vec<SensorPinMapping> = state
-        .db
-        .collection::<SensorPinMapping>(SENSOR_PIN_MAPPINGS)
-        .find(doc! {})
-        .await?
-        .try_collect()
-        .await?;
-    let molds: Vec<Mold> = state
-        .db
-        .collection::<Mold>(MOLDS)
-        .find(doc! { "isActive": true })
-        .await?
-        .try_collect()
-        .await?;
-    let depts: Vec<Department> = state
-        .db
-        .collection::<Department>(DEPARTMENTS)
-        .find(doc! { "isActive": true })
-        .await?
-        .try_collect()
-        .await?;
+pub async fn setup_status(
+    _admin: AdminUser,
+    State(state): State<AppState>,
+) -> AppResult<Json<Value>> {
+    let store = &state.store;
+    let (machines, sensors, mappings, dept_has_mold, dept_name) = try_join5(
+        store.machines.active(None, None),
+        store.sensors.active(),
+        store.pins.all(),
+        store.molds.departments_with_active(),
+        active_department_names(&store.departments.rows),
+    )
+    .await?;
 
-    let mapped: HashSet<ObjectId> = mappings.iter().map(|m| m.sensor_id.oid()).collect();
-    let dept_has_mold: HashSet<ObjectId> = molds.iter().map(|m| m.department_id.oid()).collect();
-    let dept_name: HashMap<ObjectId, String> = depts
+    let mapped: HashSet<Id> = mappings.iter().map(|m| m.sensor_id).collect();
+    // Every (machine, role) with an active sensor wired to a pin.
+    let wired: HashSet<(ObjectId, &str)> = sensors
         .iter()
-        .filter_map(|d| d.id.map(|i| (i.oid(), d.name.clone())))
+        .filter(|s| s.id.is_some_and(|i| mapped.contains(&i)))
+        .map(|s| (s.machine_id.oid(), s.sensor_type.as_str()))
         .collect();
-
-    let role_mapped = |machine: ObjectId, role: &str| {
-        sensors.iter().any(|s| {
-            s.machine_id.oid() == machine
-                && s.sensor_type == role
-                && s.id.map(|i| mapped.contains(&i.oid())).unwrap_or(false)
-        })
-    };
 
     let out: Vec<Value> = machines
         .iter()
         .filter_map(|m| {
             let mid = m.id?.oid();
-            let power_mapped = role_mapped(mid, "power");
-            let cycle_mapped = role_mapped(mid, "unit-cycle");
+            let power_mapped = wired.contains(&(mid, sensors::POWER));
+            let cycle_mapped = wired.contains(&(mid, sensors::UNIT_CYCLE));
             let mold = dept_has_mold.contains(&m.department_id.oid());
             Some(json!({
                 "machineId": mid.to_hex(),

@@ -10,8 +10,6 @@
 
 use bson::oid::ObjectId;
 use chrono::{DateTime, Utc};
-use mongodb::options::IndexOptions;
-use mongodb::{Database, IndexModel};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 // ── Collection names (must match Mongoose's pluralisation of existing data) ──
@@ -95,10 +93,10 @@ impl Id {
     pub fn new() -> Self {
         Id(ObjectId::new())
     }
-    pub fn to_hex(&self) -> String {
+    pub fn to_hex(self) -> String {
         self.0.to_hex()
     }
-    pub fn oid(&self) -> ObjectId {
+    pub fn oid(self) -> ObjectId {
         self.0
     }
 }
@@ -268,6 +266,14 @@ pub struct Machine {
     pub dimensions: Option<Dimensions>,
     #[serde(default = "default_inactive")]
     pub status: String, // running | stoppage | stopped_yet_producing | inactive
+    /// When `status` last changed (real UTC). Written by the pipeline only.
+    #[serde(
+        rename = "statusSince",
+        with = "bson_dt_opt",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    pub status_since: Option<DateTime<Utc>>,
     #[serde(rename = "isActive", default = "default_true")]
     pub is_active: bool,
     #[serde(
@@ -391,6 +397,15 @@ pub struct Plc {
     pub byte_count: i32,
     #[serde(rename = "isActive", default = "default_true")]
     pub is_active: bool,
+    /// When this PLC's daemon last posted (real UTC). Written by the pipeline,
+    /// read by the silent-PLC sweep; clients cannot set it.
+    #[serde(
+        rename = "lastSeenAt",
+        with = "bson_dt_opt",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    pub last_seen_at: Option<DateTime<Utc>>,
     #[serde(
         rename = "createdAt",
         with = "bson_dt_opt",
@@ -482,6 +497,14 @@ pub struct HourlyData {
     pub running_minutes: f64,
     #[serde(rename = "stoppageMinutes", default)]
     pub stoppage_minutes: f64,
+    /// Histogram of the gaps between units in this hour: `b0`..`b11` count the
+    /// gaps that fell under each edge in `pipeline::CYCLE_BUCKET_EDGES`.
+    #[serde(
+        rename = "cycleBuckets",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cycle_buckets: Option<bson::Document>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -530,129 +553,6 @@ pub struct ProductionRecord {
         default
     )]
     pub updated_at: Option<DateTime<Utc>>,
-}
-
-// ── Config (+ nested) ────────────────────────────────────────────────────────
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
-pub struct SignalTimeouts {
-    #[serde(rename = "powerSignalTimeout", default)]
-    pub power_signal_timeout: Option<f64>,
-    #[serde(rename = "cycleSignalTimeout", default)]
-    pub cycle_signal_timeout: Option<f64>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
-pub struct Config {
-    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
-    pub id: Option<Id>,
-    #[serde(rename = "signalTimeouts", default)]
-    pub signal_timeouts: Option<SignalTimeouts>,
-    // Remaining config sections (plc, shifts, email, thresholds) are handled in
-    // Phase 3 where the /config route is ported; the pipeline only needs timeouts.
-}
-
-// ── Index creation (run once at startup) ─────────────────────────────────────
-pub async fn ensure_indexes(db: &Database) -> anyhow::Result<()> {
-    use bson::doc;
-
-    let unique = IndexOptions::builder().unique(true).build();
-
-    // Users: unique username & email.
-    db.collection::<User>(USERS)
-        .create_index(
-            IndexModel::builder()
-                .keys(doc! { "username": 1 })
-                .options(unique.clone())
-                .build(),
-        )
-        .await?;
-    db.collection::<User>(USERS)
-        .create_index(
-            IndexModel::builder()
-                .keys(doc! { "email": 1 })
-                .options(unique.clone())
-                .build(),
-        )
-        .await?;
-
-    // SensorPinMapping: unique pinId.
-    // ── Multi-PLC migration (idempotent) ──────────────────────────────────────
-    {
-        use futures::TryStreamExt;
-        let pins = db.collection::<bson::Document>(SENSOR_PIN_MAPPINGS);
-        // Scope legacy mappings to the default PLC.
-        pins.update_many(
-            doc! { "plcId": { "$exists": false } },
-            doc! { "$set": { "plcId": DEFAULT_PLC } },
-        )
-        .await
-        .ok();
-        // Rename legacy linear pins "DQ.N" → Siemens byte.bit "Q0.N".
-        if let Ok(mut cur) = pins.find(doc! { "pinId": { "$regex": "^DQ\\." } }).await {
-            while let Ok(Some(d)) = cur.try_next().await {
-                if let (Ok(id), Ok(pin)) = (d.get_object_id("_id"), d.get_str("pinId")) {
-                    if let Some(bit) = pin.strip_prefix("DQ.") {
-                        let new_pin = format!("Q0.{bit}");
-                        pins.update_one(doc! { "_id": id }, doc! { "$set": { "pinId": new_pin } })
-                            .await
-                            .ok();
-                    }
-                }
-            }
-        }
-        // Drop the old global-unique pinId index (replaced by a per-PLC one).
-        pins.drop_index("pinId_1").await.ok();
-        // Seed a default PLC if the registry is empty.
-        let plcs = db.collection::<bson::Document>(PLCS);
-        if plcs.count_documents(doc! {}).await.unwrap_or(0) == 0 {
-            plcs.insert_one(doc! {
-                "plcId": DEFAULT_PLC, "name": "Default PLC",
-                "rack": 0, "slot": 1, "byteCount": 2, "isActive": true,
-            })
-            .await
-            .ok();
-        }
-    }
-
-    // SensorPinMapping: a pin is unique within its PLC.
-    db.collection::<SensorPinMapping>(SENSOR_PIN_MAPPINGS)
-        .create_index(
-            IndexModel::builder()
-                .keys(doc! { "plcId": 1, "pinId": 1 })
-                .options(unique.clone())
-                .build(),
-        )
-        .await?;
-    // PLC registry: unique plcId.
-    db.collection::<Plc>(PLCS)
-        .create_index(
-            IndexModel::builder()
-                .keys(doc! { "plcId": 1 })
-                .options(unique.clone())
-                .build(),
-        )
-        .await?;
-
-    // Time-series & lookup indexes (several were missing in the Node app).
-    let plain = |keys| IndexModel::builder().keys(keys).build();
-    db.collection::<SignalData>(SIGNAL_DATA)
-        .create_index(plain(doc! { "sensorId": 1, "timestamp": -1 }))
-        .await?;
-    db.collection::<SignalData>(SIGNAL_DATA)
-        .create_index(plain(doc! { "machineId": 1, "timestamp": -1 }))
-        .await?;
-    db.collection::<ProductionRecord>(PRODUCTION_RECORDS)
-        .create_index(plain(doc! { "machineId": 1, "startTime": -1 }))
-        .await?;
-    db.collection::<Machine>(MACHINES)
-        .create_index(plain(doc! { "departmentId": 1 }))
-        .await?;
-    db.collection::<Sensor>(SENSORS)
-        .create_index(plain(doc! { "machineId": 1 }))
-        .await?;
-
-    tracing::info!("MongoDB indexes ensured");
-    Ok(())
 }
 
 #[cfg(test)]

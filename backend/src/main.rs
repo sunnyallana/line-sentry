@@ -1,9 +1,14 @@
+mod alerts;
 mod auth;
 mod config;
 mod db;
 mod error;
+mod lease;
+mod mail;
 mod models;
+mod persist;
 mod pipeline;
+mod pulse;
 mod ratelimit;
 mod realtime;
 mod routes;
@@ -41,25 +46,27 @@ async fn main() -> anyhow::Result<()> {
         eprintln!("FATAL: {e}");
     })?);
 
-    // Build the (lazily-connecting) MongoDB handle.
-    let db = db::connect(&config).await?;
+    // Socket.IO layer + handle (the handle goes into AppState so handlers emit).
+    let (socket_layer, io) = realtime::build();
 
-    // Ensure indexes in the background so a momentarily-unavailable DB doesn't
-    // delay serving (non-fatal: a legacy/conflicting index shouldn't block boot).
+    // The connection is lazy, and indexes and capabilities are settled in the
+    // background, so a database that is briefly unavailable does not delay
+    // serving. Only the store keeps the database handle.
+    let store = Arc::new(persist::Store::new(db::connect(&config).await?));
     {
-        let db = db.clone();
+        let store = store.clone();
         tokio::spawn(async move {
-            if let Err(e) = models::ensure_indexes(&db).await {
+            if let Err(e) = store.detect_capabilities().await {
+                tracing::warn!("could not ask the database what it supports: {e}");
+            }
+            if let Err(e) = store.ensure_schema().await {
                 tracing::warn!("failed to ensure indexes (will retry on next boot): {e:#}");
             }
         });
     }
 
-    // Socket.IO layer + handle (the handle goes into AppState so handlers emit).
-    let (socket_layer, io) = realtime::build();
-
     let state = AppState {
-        db,
+        store: store.clone(),
         config: config.clone(),
         http: reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
@@ -74,21 +81,11 @@ async fn main() -> anyhow::Result<()> {
         )),
         io,
         pipeline: Arc::new(pipeline::PipelineState::new()),
+        pulse: Arc::new(pulse::Pulse::new()),
     };
 
-    // Background monitor: tick ongoing unclassified-stoppage durations every 60s
-    // (replaces the per-request setInterval that leaked timers in the Node app).
-    {
-        let monitor_state = state.clone();
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_secs(60));
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                ticker.tick().await;
-                pipeline::update_ongoing_stoppages(&monitor_state, chrono::Utc::now()).await;
-            }
-        });
-    }
+    // Background jobs (stoppage tick, silent-PLC sweep, daily report).
+    pulse::spawn(&state, pulse::jobs());
 
     // CORS and the Socket.IO layer wrap the router from the outside so that
     // CORS headers also apply to the /socket.io/ polling transport.
@@ -108,6 +105,8 @@ async fn main() -> anyhow::Result<()> {
         .with_graceful_shutdown(shutdown_signal())
         .await?;
 
+    // Store what the bulk writers still hold before the process ends.
+    store.shutdown().await;
     tracing::info!("shutdown complete");
     Ok(())
 }
@@ -129,6 +128,7 @@ fn build_router(state: AppState) -> Router {
     // it is exempt from the general rate limiter (high-frequency ingestion).
     let signal_routes = Router::new()
         .route("/pin-data", post(routes::signals::pin_data))
+        .route("/pin-data/batch", post(routes::signals::pin_data_batch))
         .route(
             "/unclassified-stoppages-count",
             get(routes::signals::unclassified_stoppages_count),
@@ -219,7 +219,8 @@ fn build_router(state: AppState) -> Router {
 
     let config_routes = Router::new()
         .route("/", get(routes::config::get).put(routes::config::update))
-        .route("/shifts", get(routes::config::shifts));
+        .route("/shifts", get(routes::config::shifts))
+        .route("/stoppage-reasons", get(routes::config::stoppage_reasons));
 
     let analytics_routes = Router::new()
         .route(
@@ -235,6 +236,8 @@ fn build_router(state: AppState) -> Router {
             get(routes::analytics::department_stats),
         )
         .route("/factory-stats", get(routes::analytics::factory_stats))
+        .route("/floor", get(routes::insights::floor))
+        .route("/losses", get(routes::insights::losses))
         .route("/stoppage", post(routes::analytics::add_stoppage))
         .route(
             "/production-assignment",
@@ -251,6 +254,8 @@ fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/api/health", get(health))
         .route("/api/ready", get(ready))
+        .route("/api/pulse", get(pulse::status))
+        .route("/api/alerts", get(alerts::recent))
         .nest("/api/auth", auth_routes)
         .nest("/api/signals", signal_routes)
         .nest("/api/departments", department_routes)
@@ -301,7 +306,7 @@ fn build_cors(config: &Config) -> CorsLayer {
 
 /// Liveness + DB-aware health (mirrors the Node server's `/api/health`).
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
-    let db_up = db::ping(&state.db).await;
+    let db_up = state.store.ping().await;
     let status = if db_up {
         StatusCode::OK
     } else {
@@ -318,7 +323,7 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
 
 /// Readiness probe — ready only when the database answers.
 async fn ready(State(state): State<AppState>) -> impl IntoResponse {
-    if db::ping(&state.db).await {
+    if state.store.ping().await {
         (StatusCode::OK, Json(json!({ "ready": true })))
     } else {
         (

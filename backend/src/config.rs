@@ -32,6 +32,8 @@ pub struct Config {
     /// hour/day. Defaults to the server's local offset; override with
     /// `FACTORY_UTC_OFFSET_MINUTES` (e.g. `300` for UTC+5).
     pub factory_offset_minutes: i64,
+    /// Master switch for the background jobs (`PULSE_ENABLED`, default on).
+    pub pulse_enabled: bool,
 }
 
 fn require(key: &str) -> anyhow::Result<String> {
@@ -104,6 +106,15 @@ impl Config {
             .and_then(|s| s.trim().parse::<i64>().ok())
             .unwrap_or_else(|| (chrono::Local::now().offset().local_minus_utc() as i64) / 60);
 
+        let pulse_enabled = env::var("PULSE_ENABLED")
+            .map(|v| {
+                !matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "false" | "0" | "off"
+                )
+            })
+            .unwrap_or(true);
+
         Ok(Self {
             bind_addr,
             mongodb_uri,
@@ -119,6 +130,7 @@ impl Config {
             rate_limit_auth_max,
             rate_limit_general_max,
             factory_offset_minutes,
+            pulse_enabled,
         })
     }
 

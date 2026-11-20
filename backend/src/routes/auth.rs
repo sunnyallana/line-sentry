@@ -3,13 +3,13 @@
 
 use axum::extract::State;
 use axum::Json;
-use bson::{doc, Bson, Document};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::auth::{self, AuthUser};
 use crate::error::{AppError, AppResult};
-use crate::models::{Department, User, DEPARTMENTS, USERS};
+use crate::models::{Department, User};
+use crate::persist::users::{Account, ADMIN, OPERATOR};
 use crate::state::AppState;
 
 #[derive(Deserialize)]
@@ -39,9 +39,9 @@ pub async fn login(
     }
 
     let user = state
-        .db
-        .collection::<User>(USERS)
-        .find_one(doc! { "username": &username })
+        .store
+        .users
+        .by_username(&username)
         .await?
         .ok_or_else(|| AppError::Auth("Invalid credentials".into()))?;
 
@@ -96,63 +96,40 @@ pub async fn init_demo(State(state): State<AppState>) -> AppResult<Json<Value>> 
         return Err(AppError::Forbidden);
     }
 
-    // Upsert the demo department, then read it back to get its id.
-    let depts = state.db.collection::<Document>(DEPARTMENTS);
-    depts
-        .update_one(
-            doc! { "name": "Manufacturing Department" },
-            doc! { "$set": {
-                "name": "Manufacturing Department",
-                "description": "Main manufacturing department with injection molding machines",
-                "isActive": true,
-            }},
+    let store = &state.store;
+    let department = store
+        .departments
+        .ensure(
+            "Manufacturing Department",
+            "Main manufacturing department with injection molding machines",
         )
-        .upsert(true)
-        .await?;
-    let dept = state
-        .db
-        .collection::<Department>(DEPARTMENTS)
-        .find_one(doc! { "name": "Manufacturing Department" })
         .await?
         .ok_or_else(|| {
             AppError::Internal(anyhow::anyhow!("demo department not found after upsert"))
         })?;
-    let dept_id: Bson = dept
-        .id
-        .map(|i| Bson::ObjectId(i.oid()))
-        .unwrap_or(Bson::Null);
 
-    let users = state.db.collection::<Document>(USERS);
-    let admin_hash = auth::hash_password("admin123")?;
-    users
-        .update_one(
-            doc! { "username": "admin" },
-            doc! { "$set": {
-                "username": "admin",
-                "email": "admin@company.com",
-                "password": admin_hash,
-                "role": "admin",
-                "isActive": true,
-            }},
-        )
-        .upsert(true)
-        .await?;
-
-    let operator_hash = auth::hash_password("operator123")?;
-    users
-        .update_one(
-            doc! { "username": "operator" },
-            doc! { "$set": {
-                "username": "operator",
-                "email": "operator@company.com",
-                "password": operator_hash,
-                "role": "operator",
-                "departmentId": dept_id,
-                "isActive": true,
-            }},
-        )
-        .upsert(true)
-        .await?;
+    let mut accounts = store.batch();
+    store.users.queue_account(
+        &mut accounts,
+        Account {
+            username: "admin",
+            email: "admin@company.com",
+            password_hash: auth::hash_password("admin123")?,
+            role: ADMIN,
+            department: None,
+        },
+    );
+    store.users.queue_account(
+        &mut accounts,
+        Account {
+            username: "operator",
+            email: "operator@company.com",
+            password_hash: auth::hash_password("operator123")?,
+            role: OPERATOR,
+            department: Some(department),
+        },
+    );
+    accounts.send().await?;
 
     Ok(Json(
         json!({ "message": "Demo accounts initialized successfully" }),
@@ -162,11 +139,7 @@ pub async fn init_demo(State(state): State<AppState>) -> AppResult<Json<Value>> 
 /// Fetch the user's department document (mirrors Mongoose `.populate`).
 async fn populate_department(state: &AppState, user: &User) -> AppResult<Option<Department>> {
     match user.department_id {
-        Some(did) => Ok(state
-            .db
-            .collection::<Department>(DEPARTMENTS)
-            .find_one(doc! { "_id": did.oid() })
-            .await?),
+        Some(did) => Ok(state.store.departments.by_id(did.oid()).await?),
         None => Ok(None),
     }
 }

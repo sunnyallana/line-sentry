@@ -24,14 +24,14 @@ fn on_connect(socket: SocketRef) {
     socket.on(
         "join-machine",
         |socket: SocketRef, Data::<String>(machine_id)| {
-            let _ = socket.join(format!("machine-{machine_id}"));
+            socket.join(format!("machine-{machine_id}"));
         },
     );
 
     socket.on(
         "leave-machine",
         |socket: SocketRef, Data::<String>(machine_id)| {
-            let _ = socket.leave(format!("machine-{machine_id}"));
+            socket.leave(format!("machine-{machine_id}"));
         },
     );
 

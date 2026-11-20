@@ -10,8 +10,8 @@ use serde_json::{json, Value};
 
 use crate::auth::{AdminUser, AuthUser};
 use crate::error::{AppError, AppResult};
-use crate::models::CONFIGS;
-use crate::routes::common::doc_to_json;
+use crate::persist::configs::{default_reasons, validate_reasons, StoppageReason};
+use crate::routes::common::{bson_to_json, doc_to_json};
 use crate::state::AppState;
 
 /// Default configuration document (matches the Mongoose schema defaults).
@@ -21,11 +21,13 @@ fn default_config() -> Document {
         "plc": { "ip": "192.168.1.11", "rack": 0, "slot": 1 },
         "signalTimeouts": { "powerSignalTimeout": 5, "cycleSignalTimeout": 2 },
         "shifts": Bson::Array(vec![]),
+        "stoppageReasons": default_reasons().iter().map(Bson::from).collect::<Vec<_>>(),
         "email": {
             "senderEmail": "admin@dawlance.com",
             "senderPassword": "admin123",
             "recipients": Bson::Array(vec![]),
         },
+        "reportSchedule": { "enabled": false, "hour": 6, "email": true },
         "metricsThresholds": {
             "oee": band(85, 70, 50),
             "availability": band(90, 80, 70),
@@ -42,32 +44,30 @@ fn default_config() -> Document {
 
 /// Shifts only (any authenticated user).
 pub async fn shifts(_user: AuthUser, State(state): State<AppState>) -> AppResult<Json<Value>> {
-    let cfg = state
-        .db
-        .collection::<Document>(CONFIGS)
-        .find_one(doc! {})
-        .await?;
-    match cfg.and_then(|c| c.get("shifts").cloned()) {
-        Some(Bson::Array(arr)) => Ok(Json(Value::Array(
-            arr.into_iter()
-                .map(crate::routes::common::bson_to_json)
-                .collect(),
+    match state.store.configs.shift_documents().await? {
+        Some(shifts) => Ok(Json(Value::Array(
+            shifts.into_iter().map(bson_to_json).collect(),
         ))),
-        _ => Ok(Json(json!({ "shifts": [] }))),
+        None => Ok(Json(json!({ "shifts": [] }))),
     }
+}
+
+/// The reasons a person can give for a stoppage (any authenticated user).
+pub async fn stoppage_reasons(
+    _user: AuthUser,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<StoppageReason>>> {
+    Ok(Json(state.store.configs.stoppage_reasons().await?))
 }
 
 /// Full configuration (admin). Creates defaults if none exist.
 pub async fn get(_admin: AdminUser, State(state): State<AppState>) -> AppResult<Json<Value>> {
-    let coll = state.db.collection::<Document>(CONFIGS);
-    if let Some(cfg) = coll.find_one(doc! {}).await? {
+    if let Some(cfg) = state.store.configs.document().await? {
         return Ok(Json(doc_to_json(cfg)));
     }
     let mut cfg = default_config();
-    let res = coll.insert_one(&cfg).await?;
-    if let Some(oid) = res.inserted_id.as_object_id() {
-        cfg.insert("_id", oid);
-    }
+    let id = state.store.configs.create(&cfg).await?;
+    cfg.insert("_id", id);
     Ok(Json(doc_to_json(cfg)))
 }
 
@@ -77,20 +77,13 @@ pub async fn update(
     State(state): State<AppState>,
     Json(body): Json<Value>,
 ) -> AppResult<Json<Value>> {
-    let mut set = bson::to_document(&body)
+    let sections = bson::to_document(&body)
         .map_err(|_| AppError::bad_request("invalid configuration body"))?;
-    set.remove("_id");
-    set.insert("updatedAt", Bson::DateTime(bson::DateTime::now()));
+    if let Some(reasons) = sections.get("stoppageReasons") {
+        validate_reasons(reasons).map_err(AppError::bad_request)?;
+    }
 
-    let updated = state
-        .db
-        .collection::<Document>(CONFIGS)
-        .find_one_and_update(doc! {}, doc! { "$set": set })
-        .upsert(true)
-        .return_document(mongodb::options::ReturnDocument::After)
-        .await?;
-
-    match updated {
+    match state.store.configs.save(sections).await? {
         Some(d) => Ok(Json(doc_to_json(d))),
         None => Ok(Json(json!({}))),
     }

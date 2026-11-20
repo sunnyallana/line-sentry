@@ -2,7 +2,7 @@
 //!
 //! Data endpoints (generate/list/delete) are ported here. PDF download + email
 //! are added on top via `printpdf`/`lettre` (see `reports_pdf`/`reports_email`).
-//! Metrics reuse the same OEE/MTTR/MTBF formulas as the analytics engine.
+//! The figures come from `routes::metrics`, like every other endpoint's.
 
 use std::collections::{HashMap, HashSet};
 
@@ -12,8 +12,8 @@ use axum::http::header;
 use axum::response::Response;
 use axum::Json;
 use bson::{doc, oid::ObjectId, Bson, Document};
-use chrono::{DateTime, Utc};
-use futures::TryStreamExt;
+use chrono::{DateTime, Timelike, Utc};
+use futures::future::try_join4;
 use lettre::message::header::ContentType;
 use lettre::message::{Attachment, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::Credentials;
@@ -23,91 +23,32 @@ use serde_json::{json, Value};
 
 use crate::auth::{AdminUser, AuthUser};
 use crate::error::{AppError, AppResult};
-use crate::models::*;
-use crate::routes::common::{doc_to_json, docs_to_json};
+use crate::persist::configs::reason_kinds;
+use crate::persist::Filter;
+use crate::pulse::Done;
+use crate::routes::common::{doc_to_json, docs_to_json, mold_rate, molds_used, names_by_id};
+use crate::routes::metrics::{percent, Totals};
 use crate::state::AppState;
 
-// ── Metric folding ───────────────────────────────────────────────────────────
-#[derive(Default, Clone)]
-struct Totals {
-    units: f64,
-    defective: f64,
-    running: f64,
-    stoppage: f64,
-    expected: f64,
-    stoppages: i64,
-    breakdowns: i64,
-    breakdown_min: f64,
-}
+/// How many reports are kept; older ones are dropped as new ones are stored.
+const KEPT_REPORTS: u64 = 10;
 
-fn fold(records: &[&ProductionRecord], cap: &HashMap<ObjectId, f64>) -> Totals {
-    let mut t = Totals::default();
-    for r in records {
-        t.units += r.units_produced;
-        t.defective += r.defective_units;
-        for h in &r.hourly_data {
-            t.running += h.running_minutes;
-            t.stoppage += h.stoppage_minutes;
-            t.stoppages += h.stoppages.len() as i64;
-            if let Some(mid) = h.mold_id {
-                if let Some(c) = cap.get(&mid.oid()) {
-                    if *c > 0.0 {
-                        t.expected += (c / 60.0) * h.running_minutes;
-                    }
-                }
-            }
-            for s in &h.stoppages {
-                if s.reason == "breakdown" {
-                    t.breakdowns += 1;
-                    t.breakdown_min += s.duration;
-                }
-            }
-        }
-    }
-    t
-}
+// ── Metrics ──────────────────────────────────────────────────────────────────
 
-/// Per-record-set metrics (matches Node `calculateMetricsForRecords`).
+/// The stored metrics of a set of hours. A report holds 0 where there is no
+/// performance or OEE figure. `oee_override` replaces the set's own OEE.
 fn metrics_doc(t: &Totals, oee_override: Option<i64>) -> Document {
-    let total_min = t.running + t.stoppage;
-    let availability = if total_min > 0.0 {
-        t.running / total_min
-    } else {
-        0.0
-    };
-    let quality = if t.units > 0.0 {
-        (t.units - t.defective) / t.units
-    } else {
-        0.0
-    };
-    let performance = if t.expected > 0.0 {
-        t.units / t.expected
-    } else {
-        0.0
-    };
-    let oee = oee_override
-        .unwrap_or_else(|| ((availability * quality * performance) * 100.0).round() as i64);
-    let mtbf = if t.breakdowns > 0 {
-        (t.running / t.breakdowns as f64).round() as i64
-    } else {
-        0
-    };
-    let mttr = if t.breakdowns > 0 {
-        (t.breakdown_min / t.breakdowns as f64).round() as i64
-    } else {
-        0
-    };
     doc! {
-        "oee": oee,
-        "mtbf": mtbf,
-        "mttr": mttr,
-        "availability": (availability * 100.0).round() as i64,
-        "quality": (quality * 100.0).round() as i64,
-        "performance": (performance * 100.0).round() as i64,
+        "oee": oee_override.unwrap_or_else(|| t.oee().map(percent).unwrap_or(0)),
+        "mtbf": t.mtbf_minutes().round() as i64,
+        "mttr": t.mttr_minutes().round() as i64,
+        "availability": percent(t.availability()),
+        "quality": percent(t.quality()),
+        "performance": t.performance().map(percent).unwrap_or(0),
         "totalUnitsProduced": t.units,
         "totalDefectiveUnits": t.defective,
-        "totalRunningMinutes": t.running,
-        "totalStoppageMinutes": t.stoppage,
+        "totalRunningMinutes": t.running_minutes,
+        "totalStoppageMinutes": t.stopped_minutes,
         "totalStoppages": t.stoppages,
     }
 }
@@ -160,6 +101,21 @@ fn parse_report_date(s: &str, end_of_day: bool) -> Option<DateTime<Utc>> {
     Some(naive.and_utc())
 }
 
+/// What a report covers.
+struct ReportSpec {
+    report_type: String,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    department: Option<ObjectId>,
+    machine: Option<ObjectId>,
+}
+
+/// Who asked for a report: a signed-in user, or the daily schedule.
+enum Requester {
+    User(Option<ObjectId>),
+    Schedule,
+}
+
 pub async fn generate(
     AuthUser(user): AuthUser,
     State(state): State<AppState>,
@@ -169,52 +125,64 @@ pub async fn generate(
         .ok_or_else(|| AppError::bad_request("invalid startDate"))?;
     let end = parse_report_date(&b.end_date, true)
         .ok_or_else(|| AppError::bad_request("invalid endDate"))?;
-    let dept_oid = b
+    let department = b
         .department_id
         .as_deref()
         .filter(|s| !s.is_empty())
-        .map(|s| ObjectId::parse_str(s))
+        .map(ObjectId::parse_str)
         .transpose()
         .map_err(|_| AppError::bad_request("Invalid department ID"))?;
-    let machine_oid = b
+    let machine = b
         .machine_id
         .as_deref()
         .filter(|s| !s.is_empty())
-        .map(|s| ObjectId::parse_str(s))
+        .map(ObjectId::parse_str)
         .transpose()
         .map_err(|_| AppError::bad_request("Invalid machine ID"))?;
 
-    // Load production records in range (optionally filtered by machine).
-    let mut q = doc! { "startTime": { "$gte": bson::DateTime::from_chrono(start), "$lte": bson::DateTime::from_chrono(end) } };
-    if let Some(m) = machine_oid {
-        q.insert("machineId", m);
-    }
-    let mut records: Vec<ProductionRecord> = state
-        .db
-        .collection::<ProductionRecord>(PRODUCTION_RECORDS)
-        .find(q)
-        .await?
-        .try_collect()
+    let spec = ReportSpec {
+        report_type: b.report_type,
+        start,
+        end,
+        department,
+        machine,
+    };
+    let requester = Requester::User(user.id.map(|i| i.oid()));
+    let report = build_report(&state, &spec, requester).await?;
+    Ok(Json(doc_to_json(report)))
+}
+
+/// Compute a report from the production records, store it and return it.
+async fn build_report(
+    state: &AppState,
+    spec: &ReportSpec,
+    requester: Requester,
+) -> AppResult<Document> {
+    let store = &state.store;
+    let (start, end) = (spec.start, spec.end);
+    let (dept_oid, machine_oid) = (spec.department, spec.machine);
+
+    let mut records = store
+        .records
+        .started_between(machine_oid, start, end)
         .await?;
 
+    // Everything else the report needs depends only on the records, so it is
+    // read together: one read per collection, however many rows are involved.
+    let machine_ids: HashSet<ObjectId> = records.iter().map(|r| r.machine_id.oid()).collect();
+    let (machines, molds, shifts, reasons) = try_join4(
+        store
+            .machines
+            .rows
+            .find(Filter::all().any_of("_id", machine_ids)),
+        molds_used(store, &records),
+        store.configs.shift_documents(),
+        store.configs.stoppage_reasons(),
+    )
+    .await?;
+    let kinds = reason_kinds(&reasons);
+
     // Machine → (name, departmentId) for naming + grouping.
-    let machine_ids: Vec<ObjectId> = records
-        .iter()
-        .map(|r| r.machine_id.oid())
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .collect();
-    let machines: Vec<Machine> = if machine_ids.is_empty() {
-        vec![]
-    } else {
-        state
-            .db
-            .collection::<Machine>(MACHINES)
-            .find(doc! { "_id": { "$in": &machine_ids } })
-            .await?
-            .try_collect()
-            .await?
-    };
     let machine_info: HashMap<ObjectId, (String, ObjectId)> = machines
         .iter()
         .filter_map(|m| {
@@ -232,42 +200,52 @@ pub async fn generate(
         });
     }
 
-    // Mold capacities.
-    let mold_ids: Vec<ObjectId> = records
+    // (name, startTime, endTime) of each configured shift, with its totals.
+    let mut by_shift: Vec<(String, String, String, Totals)> = shifts
+        .unwrap_or_default()
         .iter()
-        .flat_map(|r| {
-            r.hourly_data
-                .iter()
-                .filter_map(|h| h.mold_id.map(|m| m.oid()))
+        .filter_map(Bson::as_document)
+        .map(|sd| {
+            let text = |key: &str| sd.get_str(key).unwrap_or("").to_string();
+            (
+                text("name"),
+                text("startTime"),
+                text("endTime"),
+                Totals::default(),
+            )
         })
-        .collect::<HashSet<_>>()
-        .into_iter()
         .collect();
-    let mut cap: HashMap<ObjectId, f64> = HashMap::new();
-    if !mold_ids.is_empty() {
-        let molds: Vec<Mold> = state
-            .db
-            .collection::<Mold>(MOLDS)
-            .find(doc! { "_id": { "$in": mold_ids } })
-            .await?
-            .try_collect()
-            .await?;
-        for m in molds {
-            if let Some(id) = m.id {
-                cap.insert(id.oid(), m.production_capacity_per_hour);
+
+    // One pass over the hours fills every cut of the report.
+    let mut overall = Totals::default();
+    let mut by_machine: HashMap<ObjectId, Totals> = HashMap::new();
+    let mut by_dept: HashMap<ObjectId, Totals> = HashMap::new();
+    for r in &records {
+        let machine = r.machine_id.oid();
+        let department = machine_info.get(&machine).map(|(_, dep)| *dep);
+        for h in &r.hourly_data {
+            let rate = mold_rate(&molds, h);
+            overall.add_hour(h, rate, &kinds);
+            by_machine
+                .entry(machine)
+                .or_default()
+                .add_hour(h, rate, &kinds);
+            if let Some(dep) = department {
+                by_dept.entry(dep).or_default().add_hour(h, rate, &kinds);
+            }
+            for (_, start_t, end_t, totals) in by_shift.iter_mut() {
+                if shift_contains(h.hour as i64, start_t, end_t) {
+                    totals.add_hour(h, rate, &kinds);
+                }
             }
         }
     }
 
     // Per-machine metrics.
-    let mut by_machine: HashMap<ObjectId, Vec<&ProductionRecord>> = HashMap::new();
-    for r in &records {
-        by_machine.entry(r.machine_id.oid()).or_default().push(r);
-    }
     let mut machine_data = Vec::new();
     let mut machine_oees = Vec::new();
-    for (mid, recs) in &by_machine {
-        let m = metrics_doc(&fold(recs, &cap), None);
+    for (mid, totals) in &by_machine {
+        let m = metrics_doc(totals, None);
         if let Ok(o) = m.get_i64("oee") {
             machine_oees.push(o);
         }
@@ -284,83 +262,49 @@ pub async fn generate(
     };
 
     // Overall metrics (oee = avg of machine oees, per Node).
-    let all: Vec<&ProductionRecord> = records.iter().collect();
-    let overall = metrics_doc(&fold(&all, &cap), Some(avg_oee));
+    let overall = metrics_doc(&overall, Some(avg_oee));
 
     // Shift metrics.
-    let cfg = state
-        .db
-        .collection::<Document>(CONFIGS)
-        .find_one(doc! {})
-        .await?;
-    let shifts = cfg
-        .and_then(|c| c.get_array("shifts").ok().cloned())
-        .unwrap_or_default();
-    let mut shift_data = Vec::new();
-    for s in &shifts {
-        if let Bson::Document(sd) = s {
-            let name = sd.get_str("name").unwrap_or("").to_string();
-            let start_t = sd.get_str("startTime").unwrap_or("").to_string();
-            let end_t = sd.get_str("endTime").unwrap_or("").to_string();
-            let (mut units, mut defective, mut running, mut stoppage) = (0.0, 0.0, 0.0, 0.0);
-            for r in &records {
-                for h in &r.hourly_data {
-                    if shift_contains(h.hour as i64, &start_t, &end_t) {
-                        units += h.units_produced;
-                        defective += h.defective_units;
-                        running += h.running_minutes;
-                        stoppage += h.stoppage_minutes;
-                    }
-                }
-            }
-            shift_data.push(doc! {
+    let shift_data: Vec<Document> = by_shift
+        .into_iter()
+        .map(|(name, start_t, end_t, t)| {
+            doc! {
                 "shiftName": name, "startTime": start_t, "endTime": end_t,
-                "metrics": { "oee": avg_oee, "unitsProduced": units, "defectiveUnits": defective, "runningMinutes": running, "stoppageMinutes": stoppage },
-            });
-        }
-    }
+                "metrics": { "oee": avg_oee, "unitsProduced": t.units, "defectiveUnits": t.defective, "runningMinutes": t.running_minutes, "stoppageMinutes": t.stopped_minutes },
+            }
+        })
+        .collect();
 
     // Department metrics.
-    let mut by_dept: HashMap<ObjectId, Vec<&ProductionRecord>> = HashMap::new();
-    for r in &records {
-        if let Some((_, dep)) = machine_info.get(&r.machine_id.oid()) {
-            by_dept.entry(*dep).or_default().push(r);
-        }
-    }
-    let dept_ids: Vec<ObjectId> = by_dept.keys().copied().collect();
-    let dept_names: HashMap<ObjectId, String> = if dept_ids.is_empty() {
-        HashMap::new()
-    } else {
-        state
-            .db
-            .collection::<Department>(DEPARTMENTS)
-            .find(doc! { "_id": { "$in": dept_ids } })
-            .await?
-            .try_collect::<Vec<Department>>()
-            .await?
-            .into_iter()
-            .filter_map(|d| d.id.map(|id| (id.oid(), d.name)))
-            .collect()
-    };
+    let dept_names = names_by_id(
+        &store.departments.rows,
+        by_dept.keys().copied().collect(),
+        "name",
+    )
+    .await?;
     let mut department_data = Vec::new();
-    for (dep, recs) in &by_dept {
+    for (dep, totals) in &by_dept {
         department_data.push(doc! {
             "departmentId": dep,
             "departmentName": dept_names.get(dep).cloned().unwrap_or_else(|| "Unknown".into()),
-            "metrics": metrics_doc(&fold(recs, &cap), None),
+            "metrics": metrics_doc(totals, None),
         });
     }
 
     // Build + insert the report.
     let now = bson::DateTime::now();
     let mut report = doc! {
-        "type": &b.report_type,
+        "type": &spec.report_type,
         "period": { "start": bson::DateTime::from_chrono(start), "end": bson::DateTime::from_chrono(end) },
         "metrics": overall,
         "shiftData": shift_data,
         "machineData": machine_data,
         "departmentData": department_data,
-        "generatedBy": user.id.map(|i| i.oid()).map(Bson::ObjectId).unwrap_or(Bson::Null),
+        "generatedBy": match &requester {
+            Requester::User(Some(id)) => Bson::ObjectId(*id),
+            Requester::User(None) | Requester::Schedule => Bson::Null,
+        },
+        "scheduled": matches!(requester, Requester::Schedule),
         "emailSent": false,
         "createdAt": now,
         "updatedAt": now,
@@ -372,36 +316,18 @@ pub async fn generate(
         report.insert("machineId", m);
     }
 
-    let coll = state.db.collection::<Document>(REPORTS);
-    let res = coll.insert_one(&report).await?;
-    if let Some(id) = res.inserted_id.as_object_id() {
-        report.insert("_id", id);
-    }
-    cleanup_old_reports(&state).await;
+    let report = store.reports.store(report).await?;
+    cleanup_old_reports(state).await;
 
-    Ok(Json(doc_to_json(report)))
+    Ok(report)
 }
 
+/// Drop all but the newest reports. The report that was just stored is good
+/// whether or not this works, so a failure is logged and the next report
+/// tries again.
 async fn cleanup_old_reports(state: &AppState) {
-    let coll = state.db.collection::<Document>(REPORTS);
-    if let Ok(count) = coll.count_documents(doc! {}).await {
-        if count > 10 {
-            if let Ok(olds) = coll
-                .find(doc! {})
-                .sort(doc! { "createdAt": 1 })
-                .limit((count - 10) as i64)
-                .projection(doc! { "_id": 1 })
-                .await
-            {
-                if let Ok(docs) = olds.try_collect::<Vec<Document>>().await {
-                    let ids: Vec<ObjectId> = docs
-                        .iter()
-                        .filter_map(|d| d.get_object_id("_id").ok())
-                        .collect();
-                    let _ = coll.delete_many(doc! { "_id": { "$in": ids } }).await;
-                }
-            }
-        }
+    if let Err(e) = state.store.reports.keep_newest(KEPT_REPORTS).await {
+        tracing::warn!("failed to drop old reports: {e}");
     }
 }
 
@@ -411,38 +337,17 @@ pub async fn list(
     State(state): State<AppState>,
     Query(q): Query<HashMap<String, String>>,
 ) -> AppResult<Json<Value>> {
-    let mut m = Document::new();
-    if let Some(t) = q.get("type").filter(|s| !s.is_empty()) {
-        m.insert("type", t);
-    }
-    if let Some(d) = q.get("departmentId").filter(|s| !s.is_empty()) {
-        if let Ok(oid) = ObjectId::parse_str(d) {
-            m.insert("departmentId", oid);
-        }
-    }
-    if let Some(mid) = q.get("machineId").filter(|s| !s.is_empty()) {
-        if let Ok(oid) = ObjectId::parse_str(mid) {
-            m.insert("machineId", oid);
-        }
-    }
-    let stages = vec![
-        doc! { "$match": m },
-        doc! { "$lookup": { "from": USERS, "localField": "generatedBy", "foreignField": "_id", "as": "generatedBy", "pipeline": [ { "$project": { "username": 1 } } ] } },
-        doc! { "$lookup": { "from": DEPARTMENTS, "localField": "departmentId", "foreignField": "_id", "as": "departmentId" } },
-        doc! { "$lookup": { "from": MACHINES, "localField": "machineId", "foreignField": "_id", "as": "machineId" } },
-        doc! { "$addFields": {
-            "generatedBy": { "$arrayElemAt": ["$generatedBy", 0] },
-            "departmentId": { "$arrayElemAt": ["$departmentId", 0] },
-            "machineId": { "$arrayElemAt": ["$machineId", 0] },
-        }},
-        doc! { "$sort": { "createdAt": -1 } },
-    ];
-    let docs: Vec<Document> = state
-        .db
-        .collection::<Document>(REPORTS)
-        .aggregate(stages)
-        .await?
-        .try_collect()
+    let text = |key: &str| q.get(key).filter(|s| !s.is_empty());
+    // An id that does not parse is ignored rather than refused.
+    let oid = |key: &str| text(key).and_then(|s| ObjectId::parse_str(s).ok());
+    let docs = state
+        .store
+        .reports
+        .listed(
+            text("type").map(String::as_str),
+            oid("departmentId"),
+            oid("machineId"),
+        )
         .await?;
     Ok(Json(docs_to_json(docs)))
 }
@@ -453,12 +358,7 @@ pub async fn delete(
     Path(id): Path<String>,
 ) -> AppResult<Json<Value>> {
     let oid = ObjectId::parse_str(&id).map_err(|_| AppError::bad_request("invalid id"))?;
-    let res = state
-        .db
-        .collection::<Document>(REPORTS)
-        .delete_one(doc! { "_id": oid })
-        .await?;
-    if res.deleted_count == 0 {
+    if !state.store.reports.delete(oid).await? {
         return Err(AppError::NotFound);
     }
     Ok(Json(json!({ "message": "Report deleted successfully" })))
@@ -638,16 +538,17 @@ fn email_html(report: &Document, generated_by: &str) -> String {
 async fn load_report(state: &AppState, id: &str) -> AppResult<(Document, String)> {
     let oid = ObjectId::parse_str(id).map_err(|_| AppError::bad_request("invalid id"))?;
     let report = state
-        .db
-        .collection::<Document>(REPORTS)
-        .find_one(doc! { "_id": oid })
+        .store
+        .reports
+        .get(oid)
         .await?
         .ok_or(AppError::NotFound)?;
     let username = match report.get_object_id("generatedBy").ok() {
         Some(uid) => state
-            .db
-            .collection::<Document>(USERS)
-            .find_one(doc! { "_id": uid })
+            .store
+            .users
+            .rows
+            .select_one(Filter::id(uid), &["username"])
             .await?
             .and_then(|u| u.get_str("username").ok().map(|s| s.to_string()))
             .unwrap_or_default(),
@@ -679,19 +580,17 @@ pub async fn reports_pdf(
         .map_err(|e| AppError::Internal(anyhow::anyhow!("response: {e}")))
 }
 
-/// Email the report (PDF attachment) to the configured recipients.
-pub async fn reports_email(
-    _user: AuthUser,
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> AppResult<Json<Value>> {
-    let (report, username) = load_report(&state, &id).await?;
-    let cfg = state
-        .db
-        .collection::<Document>(CONFIGS)
-        .find_one(doc! {})
-        .await?;
-    let email_cfg = cfg.as_ref().and_then(|c| c.get_document("email").ok());
+/// Sender and recipients from the configuration document.
+struct EmailSettings {
+    sender: String,
+    password: String,
+    recipients: Vec<String>,
+}
+
+/// `None` when no sender or no recipient is configured.
+async fn email_settings(state: &AppState) -> AppResult<Option<EmailSettings>> {
+    let section = state.store.configs.section("email").await?;
+    let email_cfg = section.as_ref();
     let sender = email_cfg
         .and_then(|e| e.get_str("senderEmail").ok())
         .unwrap_or("")
@@ -709,19 +608,38 @@ pub async fn reports_email(
         })
         .unwrap_or_default();
     if recipients.is_empty() || sender.is_empty() {
-        return Err(AppError::bad_request("Email configuration not found"));
+        return Ok(None);
     }
+    Ok(Some(EmailSettings {
+        sender,
+        password,
+        recipients,
+    }))
+}
 
-    let bytes = render_pdf(&report, &username)?;
+/// Send the report as a PDF attachment and mark it as emailed.
+async fn send_report_email(
+    state: &AppState,
+    report: &Document,
+    generated_by: &str,
+    settings: EmailSettings,
+) -> AppResult<()> {
+    let EmailSettings {
+        sender,
+        password,
+        recipients,
+    } = settings;
+
+    let bytes = render_pdf(report, generated_by)?;
     let filename = format!(
         "{}-report-{}.pdf",
         report.get_str("type").unwrap_or("report"),
-        fmt_period(&report, "start")
+        fmt_period(report, "start")
     );
     let subject = format!(
         "{} Production Report - {}",
         report.get_str("type").unwrap_or("report").to_uppercase(),
-        fmt_period(&report, "start")
+        fmt_period(report, "start")
     );
 
     let attachment = Attachment::new(filename).body(
@@ -744,7 +662,7 @@ pub async fn reports_email(
     let message = builder
         .multipart(
             MultiPart::mixed()
-                .singlepart(SinglePart::html(email_html(&report, &username)))
+                .singlepart(SinglePart::html(email_html(report, generated_by)))
                 .singlepart(attachment),
         )
         .map_err(|e| AppError::Internal(anyhow::anyhow!("email build: {e}")))?;
@@ -760,14 +678,119 @@ pub async fn reports_email(
         .map_err(|e| AppError::Internal(anyhow::anyhow!("send failed: {e}")))?;
 
     if let Ok(oid) = report.get_object_id("_id") {
-        let _ = state
-            .db
-            .collection::<Document>(REPORTS)
-            .update_one(
-                doc! { "_id": oid },
-                doc! { "$set": { "emailSent": true, "emailSentAt": bson::DateTime::now() } },
-            )
-            .await;
+        // The email has gone out. Failing now would have the caller send it
+        // again, so a mark that could not be written is only logged.
+        if let Err(e) = state.store.reports.mark_emailed(oid).await {
+            tracing::warn!("report {oid} was emailed but could not be marked as sent: {e}");
+        }
     }
+    Ok(())
+}
+
+/// Email the report (PDF attachment) to the configured recipients.
+pub async fn reports_email(
+    _user: AuthUser,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> AppResult<Json<Value>> {
+    let (report, username) = load_report(&state, &id).await?;
+    let settings = email_settings(&state)
+        .await?
+        .ok_or_else(|| AppError::bad_request("Email configuration not found"))?;
+    send_report_email(&state, &report, &username, settings).await?;
     Ok(Json(json!({ "message": "Report emailed successfully" })))
+}
+
+// ── Daily schedule ───────────────────────────────────────────────────────────
+const SCHEDULE_AUTHOR: &str = "System";
+
+/// The `reportSchedule` section of the configuration document.
+struct ReportSchedule {
+    /// Factory-local hour (0-23) from which yesterday's report is due.
+    hour: u32,
+    email: bool,
+}
+
+impl ReportSchedule {
+    /// `None` when the section is missing or switched off.
+    async fn load(state: &AppState) -> AppResult<Option<Self>> {
+        let Some(section) = state.store.configs.section("reportSchedule").await? else {
+            return Ok(None);
+        };
+        if !section.get_bool("enabled").unwrap_or(false) {
+            return Ok(None);
+        }
+        let hour = match section.get("hour") {
+            Some(Bson::Int32(h)) => *h as i64,
+            Some(Bson::Int64(h)) => *h,
+            Some(Bson::Double(h)) => *h as i64,
+            _ => 6,
+        };
+        Ok(Some(Self {
+            hour: hour.clamp(0, 23) as u32,
+            email: section.get_bool("email").unwrap_or(true),
+        }))
+    }
+}
+
+/// One round of the daily-report job. Once the factory clock passes the
+/// configured hour it stores yesterday's report and emails it. `sent_through`
+/// is the last day already handled (`YYYY-MM-DD`); the returned cursor moves it
+/// forward only when the whole round worked, so a failed email is retried on
+/// the next round with the report that is already stored.
+pub async fn run_daily_schedule(
+    state: &AppState,
+    sent_through: Option<String>,
+    factory_now: DateTime<Utc>,
+) -> AppResult<Done> {
+    let Some(schedule) = ReportSchedule::load(state).await? else {
+        return Ok(Done::new("schedule is off"));
+    };
+    if factory_now.hour() < schedule.hour {
+        return Ok(Done::new("not due yet"));
+    }
+    let Some(day) = factory_now.date_naive().pred_opt() else {
+        return Ok(Done::new("not due yet"));
+    };
+    let label = day.format("%Y-%m-%d").to_string();
+    if sent_through.as_deref() >= Some(label.as_str()) {
+        return Ok(Done::new(format!("{label} already done")));
+    }
+
+    let (Some(start), Some(end)) = (
+        parse_report_date(&label, false),
+        parse_report_date(&label, true),
+    ) else {
+        return Err(AppError::Internal(anyhow::anyhow!(
+            "bad report day {label}"
+        )));
+    };
+
+    let stored = state.store.reports.scheduled_daily(start).await?;
+    let report = match stored {
+        Some(report) => report,
+        None => {
+            let spec = ReportSpec {
+                report_type: "daily".to_string(),
+                start,
+                end,
+                department: None,
+                machine: None,
+            };
+            build_report(state, &spec, Requester::Schedule).await?
+        }
+    };
+
+    let already_emailed = report.get_bool("emailSent").unwrap_or(false);
+    let mut detail = format!("daily report for {label} stored");
+    if schedule.email && !already_emailed {
+        match email_settings(state).await? {
+            Some(settings) => {
+                send_report_email(state, &report, SCHEDULE_AUTHOR, settings).await?;
+                detail.push_str(" and emailed");
+            }
+            None => detail.push_str("; not emailed, no sender or recipients configured"),
+        }
+    }
+    Ok(Done::new(detail).with_cursor(label))
 }

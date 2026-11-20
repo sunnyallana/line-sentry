@@ -4,7 +4,6 @@
 use axum::extract::FromRequestParts;
 use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
-use bson::doc;
 use bson::oid::ObjectId;
 use chrono::Utc;
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
@@ -12,7 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 use crate::error::AppError;
-use crate::models::{User, USERS};
+use crate::models::User;
+use crate::persist::users::ADMIN;
 use crate::state::AppState;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -116,9 +116,9 @@ impl FromRequestParts<AppState> for AuthUser {
         let claims = verify_jwt(token, &state.config.jwt_secret)?;
         let oid = ObjectId::parse_str(&claims.user_id).map_err(|_| AppError::Unauthorized)?;
         let user = state
-            .db
-            .collection::<User>(USERS)
-            .find_one(doc! { "_id": oid })
+            .store
+            .users
+            .by_id(oid)
             .await?
             .ok_or(AppError::Unauthorized)?;
         if !user.is_active {
@@ -156,7 +156,7 @@ impl FromRequestParts<AppState> for AdminUser {
 
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, AppError> {
         let AuthUser(user) = AuthUser::from_request_parts(parts, state).await?;
-        if user.role != "admin" {
+        if user.role != ADMIN {
             return Err(AppError::Forbidden);
         }
         Ok(AdminUser(user))
