@@ -6,6 +6,14 @@ header). It is the Rust port of `python-daemon/` referenced in the project
 README, built for reliable long-running operation on a Raspberry Pi: no GC
 pauses, low memory, robust retry, and graceful shutdown.
 
+Readings are never dropped because the backend is unreachable. Each reading
+goes into an in-memory outbox with the time it was taken and leaves only when
+the backend has accepted it. During an outage the daemon keeps reading on its
+beat; when the backend is back it replays what it holds, oldest first, through
+`POST /api/signals/pin-data/batch`, so production lands in the right minute and
+hour. The outbox holds 3,600 readings (an hour at one per second); past that
+the oldest are dropped and the count is logged.
+
 ## Two signal sources
 
 | Source | Feature | Use |
